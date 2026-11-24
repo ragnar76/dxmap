@@ -1,0 +1,6 @@
+# Build-Ergebnisse (per make erzeugbar)
+*.prg
+*.o
+
+# Referenzmaterial: Fremd-Quelltexte und große PDFs (~130 MB), atariprofibuch ist ein eigenes Repo
+docs/

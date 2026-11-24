@@ -1,0 +1,1570 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <mint/osbind.h>
+#include <mint/mintbind.h>
+#include <mint/ostruct.h>
+#include <windom.h>
+
+#ifndef __CDECL
+# define __CDECL
+#endif
+
+long _stksize = 32768L;
+
+#define AE  "\204"
+#define OE  "\224"
+#define UE  "\201"
+#define OEC "\231"
+
+#define APPNAME     "X-Map"
+
+typedef unsigned long long u64;
+typedef unsigned long      u32;
+
+#define NHUES       12
+#define MAXSHADE    12
+#define FIRST_PEN   112
+#define MAXCELLS    60000L
+#define PATHLEN     1024
+
+typedef struct node {
+    struct node *parent, *child, *next, *todo;
+    char *name;
+    u64 size;
+    unsigned char isdir, hue;
+} Node;
+
+typedef struct { short x, y, w, h; Node *n; } Cell;
+
+static WINDOW *mainwin;
+static short vh, cw, ch, bw, bh;
+static Node *root, *view_root, *sel, *todo;
+static int   scanning, endprog, oom, cells_full, want_open;
+static u32   n_files, n_dirs, scan_steps;
+static short scan_mask = 0x17;
+static int   show_hidden = 1;
+
+static Cell *cells;
+static long  ncells, capcells;
+static GRECT work;
+
+static short planes, nshade;
+static int   cushion_ok, cushions_on, show_dirs = 1, is_topped = 1;
+static short saved_pal[NHUES * MAXSHADE][3];
+static short pal_rgb[NHUES * MAXSHADE][3];
+static int   pal_saved;
+
+static char  title[PATHLEN + 64], scan_root[PATHLEN], status_msg[PATHLEN];
+static char  info_buf[2][PATHLEN + 64];
+static int   info_sel, busy, use_mint;
+
+#define M_INFO     8
+#define M_OPEN     10
+#define M_PREF     12
+#define M_QUIT     14
+#define M_COLOR    16
+#define M_REFRESH  17
+#define M_NOBJ     18
+
+static void fmt_size(u64 s, char *buf)
+{
+    static const char *unit[] = { "Bytes", "KB", "MB", "GB", "TB" };
+    u64 div = 1;
+    int u = 0;
+    while (u < 4 && s >= div * 1024) { div *= 1024; u++; }
+    if (u == 0)
+        sprintf(buf, "%lu Bytes", (unsigned long)s);
+    else
+        sprintf(buf, "%lu.%lu %s", (unsigned long)(s / div),
+                (unsigned long)(((s % div) * 10) / div), unit[u]);
+}
+
+static void build_path(const Node *n, char *buf, int max)
+{
+    const Node *stack[96];
+    int d = 0, i;
+    buf[0] = 0;
+    while (n && d < 96) { stack[d++] = n; n = n->parent; }
+    for (i = d - 1; i >= 0; i--) {
+        if (i != d - 1 && (int)strlen(buf) + 2 < max) strcat(buf, "\\");
+        strncat(buf, stack[i]->name, max - (int)strlen(buf) - 1);
+    }
+}
+
+static const struct { char ext[6]; unsigned char hue; } exttab[] = {
+    {"PRG",1},{"APP",1},{"TOS",1},{"TTP",1},{"GTP",1},{"ACC",1},{"CPX",1},
+    {"EXE",1},{"COM",1},{"DLL",1},{"SO",1},
+    {"ZIP",2},{"LZH",2},{"LHA",2},{"ARC",2},{"ZOO",2},{"GZ",2},{"TGZ",2},
+    {"TAR",2},{"BZ2",2},{"7Z",2},{"RAR",2},{"MSA",2},{"ST",2},{"STX",2},
+    {"DIM",2},{"ATR",2},
+    {"INF",3},{"CNF",3},{"CFG",3},{"INI",3},{"SYS",3},{"SET",3},{"RSC",3},
+    {"RSO",3},{"DEF",3},
+    {"IMG",4},{"PI1",4},{"PI2",4},{"PI3",4},{"NEO",4},{"TNY",4},{"DEG",4},
+    {"GIF",4},{"JPG",4},{"JPEG",4},{"PNG",4},{"BMP",4},{"TIF",4},{"TGA",4},
+    {"IFF",4},{"PCX",4},{"PC1",4},{"PC2",4},{"PC3",4},
+    {"MOD",5},{"MP3",5},{"MP2",5},{"WAV",5},{"AVR",5},{"SND",5},{"SNDH",5},
+    {"YM",5},{"OGG",5},{"MID",5},{"AIF",5},{"AIFF",5},{"FLAC",5},
+    {"FLI",6},{"FLC",6},{"AVI",6},{"MPG",6},{"MPEG",6},{"MP4",6},{"FLM",6},
+    {"MOV",6},
+    {"TXT",7},{"DOC",7},{"ASC",7},{"RTF",7},{"HTM",7},{"HTML",7},{"PDF",7},
+    {"HYP",7},{"1ST",7},{"MD",7},{"TEX",7},
+    {"C",8},{"H",8},{"S",8},{"ASM",8},{"CPP",8},{"PAS",8},{"BAS",8},
+    {"LUA",8},{"PY",8},{"O",8},{"A",8},
+    {"FNT",9},{"VDI",9},{"DRV",9},{"DEV",9},{"TTF",9},{"OTF",9},{"LDG",9},
+    {"SLB",9},{"XFS",9},{"XIF",9},
+    {"DAT",10},{"DB",10},{"BIN",10},{"DBF",10},{"CSV",10},{"XML",10},
+    {"JSON",10},{"MAP",10},
+    {"BAK",11},{"TMP",11},{"OLD",11},{"$$$",11},{"LOG",11},{"CHK",11}
+};
+
+static unsigned char hue_for_name(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    char e[6];
+    unsigned long hash = 0;
+    int i, len;
+
+    if (!dot || dot == name || !dot[1]) return 0;
+    dot++;
+    len = (int)strlen(dot);
+    for (i = 0; dot[i]; i++) {
+        char c = dot[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        hash = hash * 31UL + (unsigned char)c;
+        if (i < 5) e[i] = c;
+    }
+    if (len <= 5) {
+        e[len] = 0;
+        for (i = 0; i < (int)(sizeof exttab / sizeof exttab[0]); i++)
+            if (!strcmp(exttab[i].ext, e)) return exttab[i].hue;
+    }
+    return (unsigned char)(1 + hash % (NHUES - 1));
+}
+
+static Node *new_node(Node *parent, const char *name, int isdir, u64 size)
+{
+    Node *n = (Node *)calloc(1, sizeof(Node));
+    if (!n) return NULL;
+    n->name = strdup(name);
+    if (!n->name) { free(n); return NULL; }
+    n->parent = parent;
+    n->isdir  = (unsigned char)isdir;
+    n->size   = size;
+    if (parent) { n->next = parent->child; parent->child = n; }
+    if (!isdir) n->hue = hue_for_name(name);
+    return n;
+}
+
+static void free_tree(Node *n)
+{
+    Node *c, *nx;
+    if (!n) return;
+    for (c = n->child; c; c = nx) { nx = c->next; free_tree(c); }
+    free(n->name);
+    free(n);
+}
+
+static Node *msort(Node *l)
+{
+    Node *a, *b, *slow, *fast, head, *t;
+    if (!l || !l->next) return l;
+    slow = l; fast = l->next;
+    while (fast && fast->next) { slow = slow->next; fast = fast->next->next; }
+    b = slow->next; slow->next = NULL;
+    a = msort(l); b = msort(b);
+    t = &head;
+    while (a && b) {
+        if (a->size >= b->size) { t->next = a; a = a->next; }
+        else                    { t->next = b; b = b->next; }
+        t = t->next;
+    }
+    t->next = a ? a : b;
+    return head.next;
+}
+
+static void finish_dir(Node *d)
+{
+    Node *c;
+    u64 sum = 0;
+    for (c = d->child; c; c = c->next) {
+        if (c->isdir) finish_dir(c);
+        sum += c->size;
+    }
+    d->size  = sum;
+    d->child = msort(d->child);
+}
+
+static _DTA scan_dta;
+
+typedef struct {
+    unsigned short mode;
+    long           ino;
+    unsigned short dev;
+    short          rdev;
+    unsigned short nlink, uid, gid;
+    long           size, blksize, blocks;
+    unsigned long  mtime, atime, ctime;
+    short          attr, res1;
+    long           res2[2];
+} XA;
+#define XA_IFMT   0170000
+#define XA_IFDIR  0040000
+#define XA_IFREG  0100000
+
+static int use_dx = 1;
+
+static int is_dots(const char *nm)
+{
+    return nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0));
+}
+
+static int dir_next(long h, const char *base, char *buf, size_t bufsz, XA *xa)
+{
+    static char full[PATHLEN];
+    const char *nm;
+    long r, xr = 0;
+
+    if (use_dx) {
+        r = Dxreaddir((short)bufsz, h, buf, xa, &xr);
+        if (r == -32L) { use_dx = 0; return 1; }
+        if (r != 0) return -1;
+        nm = buf + 4;
+        if (is_dots(nm) || xr != 0) return 1;
+    } else {
+        r = Dreaddir((short)bufsz, h, buf);
+        if (r != 0) return -1;
+        nm = buf + 4;
+        if (is_dots(nm)) return 1;
+        if (strlen(base) + strlen(nm) >= sizeof full) return 1;
+        strcpy(full, base); strcat(full, nm);
+        if (Fxattr(1, full, xa) < 0) return 1;
+    }
+    return 0;
+}
+
+static int scan_dir_mint(Node *d, const char *dir)
+{
+    static char buf[1024];
+    static XA xa;
+    char base[PATHLEN];
+    size_t blen;
+    long h;
+
+    strncpy(base, dir, sizeof base - 3); base[sizeof base - 3] = 0;
+    blen = strlen(base);
+    if (blen == 0 || base[blen - 1] == ':') base[blen++] = '\\';
+    base[blen] = 0;
+
+    h = Dopendir(base, 0);
+    if (h == -32L) return -1;
+    if (h < 0) return 0;
+
+    if (base[blen - 1] != '\\') { base[blen++] = '\\'; base[blen] = 0; }
+
+    for (;;) {
+        const char *nm;
+        int k = dir_next(h, base, buf, sizeof buf, &xa);
+        if (k < 0) break;
+        if (k > 0) continue;
+        nm = buf + 4;
+        if (!show_hidden && (xa.attr & 0x06)) continue;
+        if ((xa.mode & XA_IFMT) == XA_IFDIR) {
+            Node *n = new_node(d, nm, 1, 0);
+            if (!n) { oom = 1; break; }
+            n->todo = todo; todo = n; n_dirs++;
+        } else if ((xa.mode & XA_IFMT) == XA_IFREG) {
+            if (!new_node(d, nm, 0, (u64)(unsigned long)xa.size)) { oom = 1; break; }
+            n_files++;
+        }
+    }
+    Dclosedir(h);
+    return 0;
+}
+
+static void scan_step(void)
+{
+    static char path[PATHLEN];
+    Node *d = todo;
+    _DTA *olddta;
+    long r;
+
+    if (!d) { scanning = 0; return; }
+    todo = d->todo;
+
+    build_path(d, path, (int)sizeof(path) - 8);
+
+    if (use_mint) {
+        if (scan_dir_mint(d, path) == 0) {
+            if (oom) todo = NULL;
+            if (!todo) scanning = 0;
+            return;
+        }
+        use_mint = 0;
+    }
+
+    strcat(path, "\\*.*");
+    olddta = Fgetdta();
+    Fsetdta(&scan_dta);
+    r = Fsfirst(path, scan_mask);
+    while (r == 0) {
+        const char *nm = scan_dta.dta_name;
+        int dots = (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0)));
+        if (!dots && !(scan_dta.dta_attribute & 0x08)) {
+            if (scan_dta.dta_attribute & 0x10) {
+                Node *n = new_node(d, nm, 1, 0);
+                if (!n) { oom = 1; break; }
+                n->todo = todo; todo = n; n_dirs++;
+            } else {
+                if (!new_node(d, nm, 0, (u64)(unsigned long)scan_dta.dta_size)) {
+                    oom = 1; break;
+                }
+                n_files++;
+            }
+        }
+        r = Fsnext();
+    }
+    Fsetdta(olddta);
+    if (oom) todo = NULL;
+    if (!todo) scanning = 0;
+}
+
+static void add_cell(Node *n, short x, short y, short w, short h)
+{
+    if (ncells >= capcells) {
+        long ncap = capcells + 1024;
+        Cell *nc;
+        if (ncells >= MAXCELLS) { cells_full = 1; return; }
+        nc = (Cell *)realloc(cells, ncap * sizeof(Cell));
+        if (!nc) { cells_full = 1; return; }
+        cells = nc; capcells = ncap;
+    }
+    cells[ncells].x = x; cells[ncells].y = y;
+    cells[ncells].w = w; cells[ncells].h = h;
+    cells[ncells].n = n;
+    ncells++;
+}
+
+static void layout_dir(Node *d, short x, short y, short w, short h);
+
+static void place(Node *n, short x, short y, short w, short h)
+{
+    if (w <= 0 || h <= 0) return;
+    if (n->isdir) {
+        if (show_dirs && w >= 10 && h >= 10) { x++; y++; w -= 2; h -= 2; }
+        layout_dir(n, x, y, w, h);
+    } else
+        add_cell(n, x, y, w, h);
+}
+
+#define WT(n) ((u32)((n)->size >> shift))
+
+static void layout_dir(Node *d, short x, short y, short w, short h)
+{
+    Node *c, *p, *q;
+    u32 R = 0;
+    int shift = 0;
+    u64 total;
+
+    if (w <= 0 || h <= 0 || !d->child || d->size == 0) return;
+
+    total = d->size;
+    while ((total >> shift) > 0xFFFFFFUL) shift++;
+    for (c = d->child; c && WT(c) > 0; c = c->next) R += WT(c);
+
+    c = d->child;
+    while (c && WT(c) > 0 && R > 0 && w > 0 && h > 0) {
+        u64  A    = (u64)(u32)w * (u32)h;
+        long side = (w >= h) ? h : w;
+        long len  = (w >= h) ? w : h;
+        u64  k    = (A << 16) / R;
+        u64  sq   = (u64)side * (u64)side;
+        u64  S = 0, amax = 0, worst_prev = 0;
+        u32  Wsum = 0;
+        int  n = 0, i;
+        long t, pos;
+        u64  cum;
+
+        for (p = c; p && WT(p) > 0; p = p->next) {
+            u64 a = ((u64)WT(p) * k) >> 16;
+            u64 S2, w1, w2, worst;
+            if (a < 1) a = 1;
+            S2 = S + a;
+            if (n == 0) amax = a;
+            w1 = (sq * amax * 256) / (S2 * S2);
+            w2 = (S2 * S2 * 256) / (sq * a);
+            worst = (w1 > w2) ? w1 : w2;
+            if (n > 0 && worst > worst_prev) break;
+            S = S2; worst_prev = worst; Wsum += WT(p); n++;
+        }
+
+        if (!p || WT(p) == 0) t = len;
+        else {
+            t = ((long)S + side / 2) / side;
+            if (t < 1) t = 1;
+            if (t > len) t = len;
+        }
+
+        pos = 0; cum = 0;
+        for (i = 0, q = c; i < n; i++, q = q->next) {
+            u64 a = ((u64)WT(q) * k) >> 16;
+            long end;
+            if (a < 1) a = 1;
+            cum += a;
+            end = (i == n - 1) ? side : (long)((cum * (u64)side) / S);
+            if (end > pos) {
+                if (w >= h) place(q, x, (short)(y + pos), (short)t, (short)(end - pos));
+                else        place(q, (short)(x + pos), y, (short)(end - pos), (short)t);
+                pos = end;
+            }
+        }
+
+        if (w >= h) { x += (short)t; w -= (short)t; }
+        else        { y += (short)t; h -= (short)t; }
+        R -= Wsum;
+        c = p;
+    }
+}
+
+static void relayout(void)
+{
+    ncells = 0; cells_full = 0;
+    if (!mainwin) return;
+    WindGet(mainwin, WF_WORKXYWH, &work.g_x, &work.g_y, &work.g_w, &work.g_h);
+    if (view_root)
+        layout_dir(view_root, work.g_x, work.g_y, work.g_w, work.g_h);
+}
+
+static void post_redraw(const GRECT *g)
+{
+    GRECT r;
+    if (!mainwin) return;
+    r = *g;
+    EvntRedrawGrect(mainwin, &r);
+}
+
+static void redraw_all(void)
+{
+    GRECT w;
+    if (!mainwin) return;
+    WindGet(mainwin, WF_WORKXYWH, &w.g_x, &w.g_y, &w.g_w, &w.g_h);
+    post_redraw(&w);
+}
+
+static void redraw_node(const Node *n)
+{
+    long i;
+    if (!n) return;
+    for (i = 0; i < ncells; i++)
+        if (cells[i].n == n) {
+            GRECT g;
+            g.g_x = cells[i].x; g.g_y = cells[i].y;
+            g.g_w = cells[i].w; g.g_h = cells[i].h;
+            post_redraw(&g);
+            return;
+        }
+}
+
+static void hsv2rgb(int hdeg, int s, int v, short *rgb)
+{
+    int i = hdeg / 60, f = hdeg % 60;
+    long p = (long)v * (1000 - s) / 1000;
+    long q = (long)v * (1000 - (long)s * f / 60) / 1000;
+    long t = (long)v * (1000 - (long)s * (60 - f) / 60) / 1000;
+    long r, g, b;
+    switch (i) {
+    case 0:  r = v; g = t; b = p; break;
+    case 1:  r = q; g = v; b = p; break;
+    case 2:  r = p; g = v; b = t; break;
+    case 3:  r = p; g = q; b = v; break;
+    case 4:  r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q; break;
+    }
+    rgb[0] = (short)r; rgb[1] = (short)g; rgb[2] = (short)b;
+}
+
+static void pal_build(void)
+{
+    static const short hue_deg[NHUES] =
+        { 0, 0, 30, 55, 90, 130, 165, 190, 215, 250, 285, 320 };
+    int hue, sh;
+    for (hue = 0; hue < NHUES; hue++)
+        for (sh = 0; sh < nshade; sh++) {
+            int v = 200 + (sh * 800) / (nshade - 1);
+            int s = (hue == 0) ? 0 : 900 - (sh * 400) / (nshade - 1);
+            hsv2rgb(hue_deg[hue], s, v, pal_rgb[hue * nshade + sh]);
+        }
+}
+
+static void pal_write(void)
+{
+    int i, n = NHUES * nshade;
+    for (i = 0; i < n; i++) vs_color(vh, FIRST_PEN + i, pal_rgb[i]);
+}
+
+static void pal_apply(void)
+{
+    int i, n = NHUES * nshade;
+    if (!pal_saved) {
+        for (i = 0; i < n; i++) vq_color(vh, FIRST_PEN + i, 0, saved_pal[i]);
+        pal_saved = 1;
+    }
+    pal_write();
+}
+
+static void pal_check(void)
+{
+    short rgb[3];
+    int p = (NHUES * nshade) / 2;
+    if (!cushions_on || !is_topped) return;
+    vq_color(vh, FIRST_PEN + p, 0, rgb);
+    if (rgb[0] != pal_rgb[p][0] || rgb[1] != pal_rgb[p][1] || rgb[2] != pal_rgb[p][2])
+        pal_write();
+}
+
+static void pal_restore(void)
+{
+    int i, n = NHUES * nshade;
+    if (!pal_saved) return;
+    for (i = 0; i < n; i++) vs_color(vh, FIRST_PEN + i, saved_pal[i]);
+    pal_saved = 0;
+}
+
+static void setup_colors(void)
+{
+    short ext[57];
+    int npens, avail;
+
+    vq_extnd(vh, 1, ext);
+    planes = ext[4];
+    npens  = (planes >= 8) ? 256 : (1 << planes);
+    avail  = npens - FIRST_PEN;
+    nshade = (avail > 0) ? (short)(avail / NHUES) : 0;
+    if (nshade > MAXSHADE) nshade = MAXSHADE;
+    cushion_ok = (planes > 4 && nshade >= 4);
+    cushions_on = cushion_ok;
+    if (cushion_ok) { pal_build(); pal_apply(); }
+}
+
+static void draw_cushion(const Cell *c)
+{
+    short pxy[4];
+    long w = c->w, h = c->h, fxo = (w * 2) / 5, fyo = (h * 2) / 5;
+    int nl = (int)((w < h) ? w : h), k, sh;
+
+    if (nl > nshade) nl = nshade;
+    if (nl < 1) nl = 1;
+    for (k = 0; k < nl; k++) {
+        pxy[0] = (short)(c->x + (fxo * k) / nl);
+        pxy[1] = (short)(c->y + (fyo * k) / nl);
+        pxy[2] = (short)(c->x + w - 1 - ((w - 1 - fxo) * k) / nl);
+        pxy[3] = (short)(c->y + h - 1 - ((h - 1 - fyo) * k) / nl);
+        sh = (nl > 1) ? (k * (nshade - 1)) / (nl - 1) : nshade / 2;
+        vsf_color(vh, FIRST_PEN + c->n->hue * nshade + sh);
+        vr_recfl(vh, pxy);
+    }
+}
+
+static void draw_flat(const Cell *c)
+{
+    static const short flatpen[NHUES] = { 8, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14 };
+    short pxy[10];
+    int hue = c->n->hue;
+
+    if (planes >= 4) {
+        vsf_interior(vh, FIS_SOLID);
+        vsf_color(vh, flatpen[hue]);
+    } else {
+        vsf_interior(vh, FIS_PATTERN);
+        vsf_style(vh, 1 + hue * 2);
+        vsf_color(vh, (planes == 2) ? 1 + hue % 3 : 1);
+    }
+    pxy[0] = c->x; pxy[1] = c->y;
+    pxy[2] = c->x + c->w - 1; pxy[3] = c->y + c->h - 1;
+    vr_recfl(vh, pxy);
+
+    if (c->w >= 3 && c->h >= 3) {
+        vsl_color(vh, 1);
+        pxy[4] = pxy[2]; pxy[5] = pxy[3];
+        pxy[6] = pxy[0]; pxy[7] = pxy[3];
+        pxy[8] = pxy[0]; pxy[9] = pxy[1];
+        pxy[2] = pxy[4]; pxy[3] = pxy[1];
+        v_pline(vh, 5, pxy);
+    }
+}
+
+static void draw_sel(const Cell *c)
+{
+    short pxy[10];
+    int inset;
+    for (inset = 0; inset < 2; inset++) {
+        short x0 = c->x + inset, y0 = c->y + inset;
+        short x1 = c->x + c->w - 1 - inset, y1 = c->y + c->h - 1 - inset;
+        if (x1 < x0 || y1 < y0) break;
+        vsl_color(vh, inset == 0 ? 1 : 0);
+        pxy[0] = x0; pxy[1] = y0; pxy[2] = x1; pxy[3] = y0;
+        pxy[4] = x1; pxy[5] = y1; pxy[6] = x0; pxy[7] = y1;
+        pxy[8] = x0; pxy[9] = y0;
+        v_pline(vh, 5, pxy);
+    }
+}
+
+static void __CDECL evnt_draw(WINDOW *win, short buff[8])
+{
+    GRECT clip;
+    short pxy[4];
+    long i;
+
+    clip.g_x = buff[4];
+    clip.g_y = buff[5];
+    clip.g_w = buff[6];
+    clip.g_h = buff[7];
+
+    vh = win->graf->handle;
+    if (clip.g_w <= 0 || clip.g_h <= 0) return;
+    pal_check();
+
+    pxy[0] = clip.g_x; pxy[1] = clip.g_y;
+    pxy[2] = clip.g_x + clip.g_w - 1; pxy[3] = clip.g_y + clip.g_h - 1;
+    vs_clip(vh, 1, pxy);
+
+    vswr_mode(vh, 1);
+    vsf_perimeter(vh, 0);
+    vsf_interior(vh, FIS_SOLID);
+    vsf_color(vh, 0);
+    vr_recfl(vh, pxy);
+    vsl_type(vh, 1);
+    vsl_width(vh, 1);
+
+    if (ncells == 0) {
+        vst_color(vh, 1);
+        if (scanning)
+            ;
+        else if (view_root)
+            v_gtext(vh, work.g_x + cw, work.g_y + 2 * ch, "(leer)");
+        else
+            v_gtext(vh, work.g_x + cw, work.g_y + 2 * ch,
+                    "Datei > " "\231" "ffnen: Laufwerk oder Ordner w" "\204" "hlen");
+    }
+
+    if (cushions_on) vsf_interior(vh, FIS_SOLID);
+    for (i = 0; i < ncells; i++) {
+        const Cell *c = &cells[i];
+        if (c->x > pxy[2] || c->y > pxy[3] ||
+            c->x + c->w - 1 < pxy[0] || c->y + c->h - 1 < pxy[1])
+            continue;
+        if (cushions_on) draw_cushion(c); else draw_flat(c);
+        if (c->n == sel) draw_sel(c);
+    }
+
+    vs_clip(vh, 0, pxy);
+}
+
+static void update_title(void)
+{
+    char path[PATHLEN], sz[40];
+    if (view_root) {
+        build_path(view_root, path, sizeof path);
+        fmt_size(view_root->size, sz);
+        if (scanning) snprintf(title, sizeof title, " %s: %s ", APPNAME, path);
+        else          snprintf(title, sizeof title, " %s: %s  (%s)%s ", APPNAME, path, sz,
+                               cells_full ? "  [Anzeige begrenzt]" : "");
+    } else
+        snprintf(title, sizeof title, " %s ", APPNAME);
+    if (mainwin) WindSetStr(mainwin, WF_NAME, title);
+}
+
+static void update_info(void)
+{
+    char path[PATHLEN], sz[40];
+    char *out;
+    size_t cap = sizeof info_buf[0];
+
+    info_sel ^= 1;
+    out = info_buf[info_sel];
+    if (scanning)
+        snprintf(out, cap, " Scanne: %lu Dateien, %lu Ordner   (Esc = Abbruch)",
+                 n_files, n_dirs);
+    else if (oom)
+        snprintf(out, cap, " Speicher voll - Ergebnis unvollst" AE "ndig");
+    else if (status_msg[0])
+        snprintf(out, cap, " %s", status_msg);
+    else if (sel) {
+        build_path(sel, path, sizeof path);
+        fmt_size(sel->size, sz);
+        snprintf(out, cap, " %s   %s", path, sz);
+    } else if (view_root)
+        snprintf(out, cap, " %lu Dateien, %lu Ordner", n_files, n_dirs);
+    else
+        snprintf(out, cap, " Kein Ordner gew" AE "hlt");
+    if (mainwin) WindSetStr(mainwin, WF_INFO, out);
+}
+
+static void start_scan(const char *p)
+{
+    char buf[PATHLEN];
+    int i, len;
+
+    strncpy(buf, p, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (i = 0; buf[i]; i++) if (buf[i] == '/') buf[i] = '\\';
+    len = (int)strlen(buf);
+    while (len > 0 && buf[len - 1] == '\\') buf[--len] = 0;
+    if (len == 0) { buf[0] = 'A' + (char)Dgetdrv(); buf[1] = ':'; buf[2] = 0; }
+
+    free_tree(root);
+    status_msg[0] = 0;
+    root = view_root = sel = todo = NULL;
+    ncells = 0; oom = 0; cells_full = 0;
+    n_files = n_dirs = scan_steps = 0;
+    strcpy(scan_root, buf);
+
+    root = new_node(NULL, buf, 1, 0);
+    if (!root) { oom = 1; update_info(); return; }
+    view_root = root;
+    todo = root;
+    scanning = 1;
+    graf_mouse(BUSYBEE, 0L);
+    update_title(); update_info(); redraw_all();
+}
+
+static void finish_scan(void)
+{
+    scanning = 0; todo = NULL;
+    graf_mouse(ARROW, 0L);
+    if (root) finish_dir(root);
+    update_title();
+    relayout();
+    redraw_all();
+    update_info();
+}
+
+static void choose_folder(void)
+{
+    static char fpath[PATHLEN], fname[64];
+    int len;
+
+    if (!fpath[0]) sprintf(fpath, "%c:\\", 'A' + (int)Dgetdrv());
+    fname[0] = 0;
+    if (!FselInput(fpath, fname, "*.*", APPNAME ": Ordner w" AE "hlen", NULL, NULL))
+        return;
+    len = (int)strlen(fpath);
+    if (len > 0) start_scan(fpath);
+}
+
+static void select_node(Node *n)
+{
+    Node *old = sel;
+    status_msg[0] = 0;
+    sel = n;
+    redraw_node(old);
+    redraw_node(n);
+    update_info();
+}
+
+static void zoom_in(void)
+{
+    Node *a = sel;
+    if (!a || scanning) return;
+    while (a && a->parent != view_root) a = a->parent;
+    if (a && a->isdir) {
+        view_root = a;
+        update_title(); relayout(); redraw_all(); update_info();
+    }
+}
+
+static void zoom_out(void)
+{
+    if (scanning || !view_root || !view_root->parent) return;
+    view_root = view_root->parent;
+    sel = NULL;
+    update_title(); relayout(); redraw_all(); update_info();
+}
+
+static void refresh(void)
+{
+    char p[PATHLEN];
+    if (scanning) return;
+    if (!scan_root[0]) { choose_folder(); return; }
+    strcpy(p, scan_root);
+    start_scan(p);
+}
+
+static void toggle_colors(void)
+{
+    if (!cushion_ok) return;
+    cushions_on = !cushions_on;
+    if (cushions_on) pal_apply();
+    else pal_restore();
+    MenuIcheck(mainwin, M_COLOR, cushions_on);
+    redraw_all();
+}
+
+static void settings(void)
+{
+    char buf[400];
+    int b;
+    for (;;) {
+        sprintf(buf,
+            "[2][Einstellungen:|Ordnerr" AE "nder: %s|Versteckte Dateien: %s|"
+            "(wirkt nach Aktualisieren)][R" AE "nder|Versteckte|Fertig]",
+            show_dirs ? "an" : "aus", show_hidden ? "ja" : "nein");
+        b = FormAlert(3, buf);
+        if (b == 1) { show_dirs = !show_dirs; relayout(); redraw_all(); }
+        else if (b == 2) { show_hidden = !show_hidden; scan_mask = show_hidden ? 0x17 : 0x10; }
+        else break;
+    }
+}
+
+static char lastdest[PATHLEN];
+static short popup_x, popup_y;
+
+static int ci_char(int c)
+{
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c == '/') c = '\\';
+    return c;
+}
+
+static int ci_eq(const char *a, const char *b)
+{
+    while (*a && *b && ci_char((unsigned char)*a) == ci_char((unsigned char)*b)) { a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
+static int ci_prefix(const char *s, const char *pre)
+{
+    while (*pre && *s && ci_char((unsigned char)*s) == ci_char((unsigned char)*pre)) { s++; pre++; }
+    return *pre == 0;
+}
+
+static void safe_text(char *dst, const char *src, int max)
+{
+    int len = (int)strlen(src), i = 0;
+    if (len > max) { src += len - max + 3; dst[i++] = '.'; dst[i++] = '.'; dst[i++] = '.'; }
+    for (; *src && i < max; src++) {
+        char c = *src;
+        if (c == '|' || c == '[' || c == ']' || c == '%') c = '_';
+        dst[i++] = c;
+    }
+    dst[i] = 0;
+}
+
+static void err_alert(const char *what, const char *name, long code)
+{
+    char n[48], b[300];
+    safe_text(n, name, 36);
+    sprintf(b, "[3][%s|%s|Fehler %ld][ OK ]", what, n, code);
+    FormAlert(1, b);
+}
+
+static int file_exists(const char *path)
+{
+    long h = Fopen(path, 0);
+    if (h >= 0) { Fclose((short)h); return 1; }
+    return 0;
+}
+
+static long copy_file(const char *src, const char *dst)
+{
+    long hs, hd, r = 0, n, bufsz = 32768L;
+    char *buf;
+    _DOSTIME dt;
+    int have_dt;
+
+    buf = (char *)malloc(bufsz);
+    if (!buf) { bufsz = 4096L; buf = (char *)malloc(bufsz); }
+    if (!buf) return -39;
+
+    hs = Fopen(src, 0);
+    if (hs < 0) { free(buf); return hs; }
+    hd = Fcreate(dst, 0);
+    if (hd < 0) { Fclose((short)hs); free(buf); return hd; }
+
+    have_dt = (Fdatime(&dt, (short)hs, 0) == 0);
+    for (;;) {
+        n = Fread((short)hs, bufsz, buf);
+        if (n < 0) { r = n; break; }
+        if (n == 0) break;
+        if (Fwrite((short)hd, n, buf) != n) { r = -1; break; }
+    }
+    if (r == 0 && have_dt) Fdatime(&dt, (short)hd, 1);
+    Fclose((short)hs);
+    Fclose((short)hd);
+    if (r != 0) Fdelete(dst);
+    free(buf);
+    return r;
+}
+
+static void size_adjust(Node *d, u64 delta, int add)
+{
+    for (; d; d = d->parent) {
+        if (add) d->size += delta;
+        else     d->size = (d->size >= delta) ? d->size - delta : 0;
+        if (d->parent) d->parent->child = msort(d->parent->child);
+    }
+}
+
+static void node_remove(Node *n)
+{
+    Node *p = n->parent, **pp;
+    u64 sz = n->size;
+    if (!p) return;
+    for (pp = &p->child; *pp; pp = &(*pp)->next)
+        if (*pp == n) { *pp = n->next; break; }
+    n->next = NULL;
+    if (sel == n) sel = NULL;
+    free_tree(n);
+    if (n_files) n_files--;
+    size_adjust(p, sz, 0);
+}
+
+static Node *find_dir(const char *path)
+{
+    char rp[PATHLEN], tp[PATHLEN];
+    const char *p;
+    Node *d;
+    size_t len;
+
+    if (!root) return NULL;
+    build_path(root, rp, sizeof rp);
+    strncpy(tp, path, sizeof tp - 1); tp[sizeof tp - 1] = 0;
+    for (len = strlen(rp); len > 0 && (rp[len - 1] == '\\' || rp[len - 1] == '/'); ) rp[--len] = 0;
+    for (len = strlen(tp); len > 0 && (tp[len - 1] == '\\' || tp[len - 1] == '/'); ) tp[--len] = 0;
+    if (!ci_prefix(tp, rp)) return NULL;
+    p = tp + strlen(rp);
+    if (*p && *p != '\\' && *p != '/') return NULL;
+
+    d = root;
+    while (*p) {
+        char comp[260];
+        Node *c;
+        int i = 0;
+        p++;
+        while (*p && *p != '\\' && *p != '/' && i < (int)sizeof comp - 1) comp[i++] = *p++;
+        comp[i] = 0;
+        if (!comp[0]) continue;
+        for (c = d->child; c; c = c->next)
+            if (c->isdir && ci_eq(c->name, comp)) break;
+        if (!c) return NULL;
+        d = c;
+    }
+    return d;
+}
+
+static void note_new_file(const char *dst, u64 size)
+{
+    char dir[PATHLEN];
+    const char *name;
+    char *a, *b, *cut;
+    Node *dd, *old;
+
+    strncpy(dir, dst, sizeof dir - 1); dir[sizeof dir - 1] = 0;
+    a = strrchr(dir, '\\'); b = strrchr(dir, '/');
+    cut = (a > b) ? a : b;
+    if (!cut) return;
+    name = cut + 1;
+    *cut = 0;
+    dd = find_dir(dir);
+    if (!dd) return;
+    for (old = dd->child; old; old = old->next)
+        if (!old->isdir && ci_eq(old->name, name)) { node_remove(old); break; }
+    if (new_node(dd, name, 0, size)) {
+        n_files++;
+        dd->child = msort(dd->child);
+        size_adjust(dd, size, 1);
+    }
+}
+
+static void finish_op(void)
+{
+    update_title();
+    relayout();
+    redraw_all();
+    update_info();
+}
+
+#define MAXSUB   300
+#define ITEMLEN  96
+
+static int cmp_names(const void *a, const void *b)
+{
+    const char *x = *(char *const *)a, *y = *(char *const *)b;
+    while (*x && *y && ci_char((unsigned char)*x) == ci_char((unsigned char)*y)) { x++; y++; }
+    return ci_char((unsigned char)*x) - ci_char((unsigned char)*y);
+}
+
+static int add_name(char ***v, int *n, int *cap, const char *nm)
+{
+    if (*n >= MAXSUB) return 0;
+    if (*n >= *cap) {
+        int nc = *cap + 32;
+        char **nv = (char **)realloc(*v, nc * sizeof(char *));
+        if (!nv) return 0;
+        *v = nv; *cap = nc;
+    }
+    (*v)[*n] = strdup(nm);
+    if (!(*v)[*n]) return 0;
+    (*n)++;
+    return 1;
+}
+
+static int list_subdirs(const char *dir, char ***out)
+{
+    char **v = NULL;
+    int n = 0, cap = 0;
+    char base[PATHLEN];
+    size_t blen;
+
+    strncpy(base, dir, sizeof base - 8); base[sizeof base - 8] = 0;
+    blen = strlen(base);
+    if (blen == 0 || (base[blen - 1] != '\\' && base[blen - 1] != '/')) { base[blen++] = '\\'; base[blen] = 0; }
+
+    if (use_mint) {
+        static char buf[1024];
+        static XA xa;
+        long h = Dopendir(base, 0);
+        if (h >= 0) {
+            for (;;) {
+                int k = dir_next(h, base, buf, sizeof buf, &xa);
+                if (k < 0) break;
+                if (k > 0) continue;
+                if ((xa.mode & XA_IFMT) == XA_IFDIR && !add_name(&v, &n, &cap, buf + 4)) break;
+            }
+            Dclosedir(h);
+            goto done;
+        }
+        if (h != -32L) goto done;
+        use_mint = 0;
+    }
+    {
+        char pat[PATHLEN];
+        _DTA *olddta = Fgetdta();
+        long r;
+        strcpy(pat, base); strcat(pat, "*.*");
+        Fsetdta(&scan_dta);
+        for (r = Fsfirst(pat, 0x17); r == 0; r = Fsnext()) {
+            const char *nm = scan_dta.dta_name;
+            if ((scan_dta.dta_attribute & 0x10) && !is_dots(nm) && !add_name(&v, &n, &cap, nm)) break;
+        }
+        Fsetdta(olddta);
+    }
+done:
+    if (n > 1) qsort(v, n, sizeof(char *), cmp_names);
+    *out = v;
+    return n;
+}
+
+enum { K_RECENT, K_DRIVE, K_FSEL, K_HERE, K_UP, K_DIR };
+
+static char *make_item(const char *fmt, const char *a)
+{
+    char *it = (char *)malloc(ITEMLEN);
+    if (it) snprintf(it, ITEMLEN, fmt, a);
+    return it;
+}
+
+static int pick_folder(const char *verb, short mx, short my, char *out, int max)
+{
+    char cur[PATHLEN];
+    short x = mx, y = my;
+    int rows = app.h / (ch + 3) - 2;
+    int cap = MAXSUB + 8;
+    char **items = (char **)malloc(cap * sizeof(char *));
+    char **names = (char **)malloc(cap * sizeof(char *));
+    int *kind = (int *)malloc(cap * sizeof(int));
+    int result = 0;
+
+    if (rows < 6) rows = 6;
+    cur[0] = 0;
+    if (!items || !names || !kind) goto out;
+
+    for (;;) {
+        char **sub = NULL;
+        int n = 0, nsub = 0, r, i, len;
+        short mb, ks;
+        char t[64], label[ITEMLEN];
+
+        if (!cur[0]) {
+            long map = Drvmap();
+            if (lastdest[0]) {
+                safe_text(t, lastdest, 34);
+                items[n] = make_item(" Zuletzt: %s ", t); names[n] = NULL; kind[n++] = K_RECENT;
+            }
+            for (i = 0; i < 26; i++)
+                if (map & (1L << i)) {
+                    char dl[4];
+                    dl[0] = (char)('A' + i); dl[1] = ':'; dl[2] = '\\'; dl[3] = 0;
+                    snprintf(label, sizeof label, " %c:  >", 'A' + i);
+                    items[n] = strdup(label); names[n] = strdup(dl); kind[n++] = K_DRIVE;
+                }
+            items[n] = strdup(" Dateiauswahl... "); names[n] = NULL; kind[n++] = K_FSEL;
+        } else {
+            safe_text(t, cur, 30);
+            snprintf(label, sizeof label, " %s hierher: %s ", verb, t);
+            items[n] = strdup(label); names[n] = NULL; kind[n++] = K_HERE;
+            items[n] = strdup(" .. Zur" UE "ck "); names[n] = NULL; kind[n++] = K_UP;
+            nsub = list_subdirs(cur, &sub);
+            for (i = 0; i < nsub && n < cap; i++) {
+                safe_text(t, sub[i], 34);
+                snprintf(label, sizeof label, " %s  >", t);
+                items[n] = strdup(label); names[n] = sub[i]; kind[n++] = K_DIR;
+            }
+        }
+
+        for (i = 0; i < n; i++) if (!items[i]) { r = -1; goto cleanup_fail; }
+        r = MenuPopUp(items, x, y, n, n < rows ? n : rows, 0, P_LIST | P_WNDW);
+        graf_mkstate(&x, &y, &mb, &ks);
+
+        if (r < 0 || r >= n) { result = 0; goto cleanup_done; }
+
+        switch (kind[r]) {
+        case K_RECENT:
+            strncpy(out, lastdest, max - 1); out[max - 1] = 0; result = 1; goto cleanup_done;
+        case K_FSEL:
+            result = 2; goto cleanup_done;
+        case K_HERE:
+            strncpy(out, cur, max - 1); out[max - 1] = 0; result = 1; goto cleanup_done;
+        case K_DRIVE:
+            strcpy(cur, names[r]);
+            break;
+        case K_UP:
+            len = (int)strlen(cur);
+            while (len > 0 && cur[len - 1] == '\\') cur[--len] = 0;
+            {
+                char *bs = strrchr(cur, '\\');
+                if (bs) bs[1] = 0; else cur[0] = 0;
+            }
+            break;
+        case K_DIR:
+            if (strlen(cur) + strlen(names[r]) + 2 < sizeof cur) {
+                strcat(cur, names[r]); strcat(cur, "\\");
+            }
+            break;
+        }
+        for (i = 0; i < n; i++) { free(items[i]); if (kind[i] == K_DRIVE) free(names[i]); }
+        for (i = 0; i < nsub; i++) free(sub[i]);
+        free(sub);
+        continue;
+
+cleanup_fail:
+cleanup_done:
+        for (i = 0; i < n; i++) { free(items[i]); if (kind[i] == K_DRIVE) free(names[i]); }
+        for (i = 0; i < nsub; i++) free(sub[i]);
+        free(sub);
+        break;
+    }
+out:
+    free(items); free(names); free(kind);
+    return result;
+}
+
+static int choose_dest_fsel(const Node *n, const char *ttl, char *dst, int max)
+{
+    static char dpath[PATHLEN], dname[260];
+    int len;
+
+    if (lastdest[0]) strcpy(dpath, lastdest);
+    else {
+        build_path(n->parent, dpath, sizeof dpath - 2);
+        len = (int)strlen(dpath);
+        if (len > 0 && dpath[len - 1] != '\\') { dpath[len++] = '\\'; dpath[len] = 0; }
+    }
+    strncpy(dname, n->name, sizeof dname - 1); dname[sizeof dname - 1] = 0;
+    if (!FselInput(dpath, dname, "*.*", (char *)ttl, NULL, NULL)) return 0;
+    if (!dname[0]) return 0;
+
+    strncpy(lastdest, dpath, sizeof lastdest - 1); lastdest[sizeof lastdest - 1] = 0;
+    len = (int)strlen(dpath);
+    if (len > 0 && dpath[len - 1] != '\\' && dpath[len - 1] != '/') { dpath[len++] = '\\'; dpath[len] = 0; }
+    if (len + (int)strlen(dname) + 1 >= max) return 0;
+    strcpy(dst, dpath);
+    strcat(dst, dname);
+    return 1;
+}
+
+static int choose_dest(const Node *n, const char *verb, char *dst, int max)
+{
+    char folder[PATHLEN], ttl[48];
+    int r, len;
+
+    r = pick_folder(verb, popup_x, popup_y, folder, sizeof folder);
+    if (r == 0) return 0;
+    if (r == 2) {
+        snprintf(ttl, sizeof ttl, "%s nach", verb);
+        return choose_dest_fsel(n, ttl, dst, max);
+    }
+    strncpy(lastdest, folder, sizeof lastdest - 1); lastdest[sizeof lastdest - 1] = 0;
+    len = (int)strlen(folder);
+    if (len > 0 && folder[len - 1] != '\\' && folder[len - 1] != '/') { folder[len++] = '\\'; folder[len] = 0; }
+    if (len + (int)strlen(n->name) + 1 >= max) return 0;
+    strcpy(dst, folder);
+    strcat(dst, n->name);
+    return 1;
+}
+
+static int dest_ok(const char *src, const char *dst)
+{
+    if (ci_eq(src, dst)) {
+        FormAlert(1, "[1][Quelle und Ziel sind|identisch.][ OK ]");
+        return 0;
+    }
+    if (file_exists(dst)) {
+        if (FormAlert(2, "[2][Die Zieldatei existiert.|\232berschreiben?][Ja|Nein]") != 1)
+            return 0;
+        return 2;
+    }
+    return 1;
+}
+
+static void op_copy(Node *n)
+{
+    char src[PATHLEN], dst[PATHLEN], nm[300];
+    long r;
+    int ok;
+    u64 size = n->size;
+
+    build_path(n, src, sizeof src);
+    if (!choose_dest(n, "Kopieren", dst, sizeof dst)) return;
+    if (!(ok = dest_ok(src, dst))) return;
+
+    graf_mouse(BUSYBEE, 0L);
+    r = copy_file(src, dst);
+    graf_mouse(ARROW, 0L);
+    if (r < 0) { err_alert("Kopieren fehlgeschlagen", n->name, r); return; }
+
+    strncpy(nm, n->name, sizeof nm - 1); nm[sizeof nm - 1] = 0;
+    note_new_file(dst, size);
+    snprintf(status_msg, sizeof status_msg, "Kopiert: %s", nm);
+    finish_op();
+}
+
+static void op_move(Node *n)
+{
+    char src[PATHLEN], dst[PATHLEN], nm[300];
+    long r;
+    int ok, copied = 0;
+    u64 size = n->size;
+
+    build_path(n, src, sizeof src);
+    if (!choose_dest(n, "Verschieben", dst, sizeof dst)) return;
+    if (!(ok = dest_ok(src, dst))) return;
+    strncpy(nm, n->name, sizeof nm - 1); nm[sizeof nm - 1] = 0;
+
+    graf_mouse(BUSYBEE, 0L);
+    if (ok == 2) Fdelete(dst);
+    r = Frename(0, src, dst);
+    if (r < 0) {
+        r = copy_file(src, dst);
+        if (r == 0) {
+            copied = 1;
+            if (Fdelete(src) < 0) copied = 2;
+        }
+    }
+    graf_mouse(ARROW, 0L);
+    if (r < 0) { err_alert("Verschieben fehlgeschlagen", nm, r); return; }
+
+    if (copied != 2) node_remove(n);
+    note_new_file(dst, size);
+    if (copied == 2)
+        snprintf(status_msg, sizeof status_msg, "Kopiert, Quelle nicht gel" OE "scht: %s", nm);
+    else
+        snprintf(status_msg, sizeof status_msg, "Verschoben: %s", nm);
+    finish_op();
+}
+
+static void op_delete(Node *n)
+{
+    char src[PATHLEN], b[300], t[48], sz[40], nm[300];
+    long r;
+
+    safe_text(t, n->name, 36);
+    fmt_size(n->size, sz);
+    sprintf(b, "[2][Datei l" OE "schen?|%s|%s][L" OE "schen|Abbruch]", t, sz);
+    if (FormAlert(2, b) != 1) return;
+
+    build_path(n, src, sizeof src);
+    strncpy(nm, n->name, sizeof nm - 1); nm[sizeof nm - 1] = 0;
+    r = Fdelete(src);
+    if (r < 0) { err_alert("L" OE "schen fehlgeschlagen", nm, r); return; }
+
+    node_remove(n);
+    snprintf(status_msg, sizeof status_msg, "Gel" OE "scht: %s", nm);
+    finish_op();
+}
+
+static void file_popup(Node *n, short mx, short my)
+{
+    static char *items[3] = { "  Kopieren...  ", "  Verschieben...  ", "  L" OE "schen  " };
+    int r;
+
+    busy = 1;
+    popup_x = mx; popup_y = my;
+    select_node(n);
+    r = MenuPopUp(items, mx, my, 3, 3, 0, P_LIST | P_WNDW);
+    if      (r == 0) op_copy(n);
+    else if (r == 1) op_move(n);
+    else if (r == 2) op_delete(n);
+    busy = 0;
+}
+
+static OBJECT menutree[M_NOBJ];
+
+static void obj(int i, int next, int head, int tail, int type, int flags,
+                int state, long spec, const char *str,
+                int x, int y, int w, int h)
+{
+    OBJECT *o = &menutree[i];
+    o->ob_next = next; o->ob_head = head; o->ob_tail = tail;
+    o->ob_type = type; o->ob_flags = flags; o->ob_state = state;
+    if (str) o->ob_spec.free_string = (char *)str; else o->ob_spec.index = spec;
+    o->ob_x = x; o->ob_y = y; o->ob_width = w; o->ob_height = h;
+}
+
+static void build_menu(int scrw)
+{
+    static char t0[] = " " APPNAME " ", t1[] = " Datei ", t2[] = " Ansicht ";
+    static char i_info[]  = "  Info...  ";
+    static char i_open[]  = "  " OEC "ffnen...  ";
+    static char i_pref[]  = "  Einstellungen...  ";
+    static char i_quit[]  = "  Beenden  ";
+    static char i_color[] = "  Farbmodus  ";
+    static char i_upd[]   = "  Aktualisieren  ";
+    static char sep1[40], sep2[40];
+    int barh = ch + 3;
+    int l0 = (int)strlen(t0), l1 = (int)strlen(t1), l2 = (int)strlen(t2);
+    int w0 = (int)strlen(i_info);
+    int w1 = (int)strlen(i_pref);
+    int w2 = (int)strlen(i_upd);
+    int tx0 = 0, tx1 = l0 * cw, tx2 = (l0 + l1) * cw;
+    int base = cw;
+    int i;
+
+    for (i = 0; i < w1; i++) sep1[i] = sep2[i] = '-';
+    sep1[w1] = sep2[w1] = 0;
+
+    obj(0, -1, 1, 6, G_IBOX, OF_NONE, 0, 0L, NULL, 0, 0, scrw, barh + 6 * ch);
+    obj(1, 6, 2, 2, G_BOX, OF_NONE, 0, 0x00001100L, NULL, 0, 0, scrw, barh);
+    obj(2, 1, 3, 5, G_IBOX, OF_NONE, 0, 0L, NULL, base, 0, (l0 + l1 + l2) * cw, barh);
+    obj(3, 4, -1, -1, G_TITLE, OF_NONE, 0, 0L, t0, tx0, 0, l0 * cw, barh);
+    obj(4, 5, -1, -1, G_TITLE, OF_NONE, 0, 0L, t1, tx1, 0, l1 * cw, barh);
+    obj(5, 2, -1, -1, G_TITLE, OF_NONE, 0, 0L, t2, tx2, 0, l2 * cw, barh);
+    obj(6, 0, 7, 15, G_IBOX, OF_NONE, 0, 0L, NULL, 0, barh, scrw, 6 * ch);
+
+    obj(7, 9, 8, 8, G_BOX, OF_NONE, 0, 0x00FF1100L, NULL, base + tx0, 0, w0 * cw, ch);
+    obj(M_INFO, 7, -1, -1, G_STRING, OF_NONE, 0, 0L, i_info, 0, 0, w0 * cw, ch);
+
+    obj(9, 15, 10, 14, G_BOX, OF_NONE, 0, 0x00FF1100L, NULL, base + tx1, 0, w1 * cw, 5 * ch);
+    obj(M_OPEN, 11, -1, -1, G_STRING, OF_NONE, 0, 0L, i_open, 0, 0 * ch, w1 * cw, ch);
+    obj(11, 12, -1, -1, G_STRING, OF_NONE, OS_DISABLED, 0L, sep1, 0, 1 * ch, w1 * cw, ch);
+    obj(M_PREF, 13, -1, -1, G_STRING, OF_NONE, 0, 0L, i_pref, 0, 2 * ch, w1 * cw, ch);
+    obj(13, 14, -1, -1, G_STRING, OF_NONE, OS_DISABLED, 0L, sep2, 0, 3 * ch, w1 * cw, ch);
+    obj(M_QUIT, 9, -1, -1, G_STRING, OF_NONE, 0, 0L, i_quit, 0, 4 * ch, w1 * cw, ch);
+
+    obj(15, 6, 16, 17, G_BOX, OF_NONE, 0, 0x00FF1100L, NULL, base + tx2, 0, w2 * cw, 2 * ch);
+    obj(M_COLOR, 17, -1, -1, G_STRING, OF_NONE, 0, 0L, i_color, 0, 0, w2 * cw, ch);
+    obj(M_REFRESH, 15, -1, -1, G_STRING, OF_LASTOB, 0, 0L, i_upd, 0, ch, w2 * cw, ch);
+
+    if (!cushion_ok) menutree[M_COLOR].ob_state |= OS_DISABLED;
+}
+
+static void __CDECL menu_unhilight(WINDOW *win, short msg[])
+{
+    MenuTnormal(win, msg[3], 1);
+}
+
+static void __CDECL mi_info(WINDOW *win, int index, int ttl, void *data)
+{
+    FormAlert(1, "[1][" APPNAME " f" UE "r Atari|Treemap der Plattenbelegung|"
+                 "Rechtsklick auf Datei:|Kopieren, Verschieben, L" OE "schen][ OK ]");
+    MenuTnormal(win, ttl, 1);
+}
+
+static void __CDECL mi_open(WINDOW *win, int index, int ttl, void *data)
+{
+    MenuTnormal(win, ttl, 1);
+    if (!scanning) choose_folder();
+}
+
+static void __CDECL mi_pref(WINDOW *win, int index, int ttl, void *data)
+{
+    MenuTnormal(win, ttl, 1);
+    settings();
+}
+
+static void __CDECL mi_quit(WINDOW *win, int index, int ttl, void *data)
+{
+    ApplWrite(_AESapid, WM_DESTROY, win->handle, 0, 0, 0, 0);
+}
+
+static void __CDECL mi_color(WINDOW *win, int index, int ttl, void *data)
+{
+    MenuTnormal(win, ttl, 1);
+    toggle_colors();
+}
+
+static void __CDECL mi_refresh(WINDOW *win, int index, int ttl, void *data)
+{
+    MenuTnormal(win, ttl, 1);
+    refresh();
+}
+
+static void __CDECL on_geom(WINDOW *win, short buff[8])
+{
+    GRECT w;
+    long i;
+    WindGet(win, WF_WORKXYWH, &w.g_x, &w.g_y, &w.g_w, &w.g_h);
+    if (w.g_w != work.g_w || w.g_h != work.g_h) {
+        relayout();
+        redraw_all();
+    } else if (w.g_x != work.g_x || w.g_y != work.g_y) {
+        short dx = w.g_x - work.g_x;
+        short dy = w.g_y - work.g_y;
+        for (i = 0; i < ncells; i++) {
+            cells[i].x += dx;
+            cells[i].y += dy;
+        }
+        work = w;
+    }
+}
+
+static void __CDECL on_top(WINDOW *win, short buff[8])
+{
+    is_topped = 1;
+    if (cushions_on) pal_apply();
+}
+
+static void __CDECL on_untop(WINDOW *win, short buff[8])
+{
+    is_topped = 0;
+    pal_restore();
+}
+
+static void __CDECL on_destroy(WINDOW *win, short buff[8])
+{
+    pal_restore();
+    endprog = 1;
+}
+
+static void __CDECL on_apterm(WINDOW *win, short buff[8])
+{
+    if (mainwin) ApplWrite(_AESapid, WM_DESTROY, mainwin->handle, 0, 0, 0, 0);
+    else endprog = 1;
+}
+
+static void __CDECL on_timer(WINDOW *win, short buff[8])
+{
+    if (busy || !scanning) return;
+    scan_step();
+    if ((scan_steps++ & 15) == 0 && scanning) update_info();
+    if (!scanning) finish_scan();
+}
+
+static void __CDECL on_key(WINDOW *win, short buff[8])
+{
+    int k = evnt.keybd & 0xFF;
+    if (k >= 'a' && k <= 'z') k -= 32;
+    switch (k) {
+    case 'Q': case 0x11: ApplWrite(_AESapid, WM_DESTROY, win->handle, 0, 0, 0, 0); break;
+    case 'O': if (!scanning) choose_folder(); break;
+    case 'R': refresh(); break;
+    case 'C': toggle_colors(); break;
+    case 'G': show_dirs = !show_dirs; relayout(); redraw_all(); break;
+    case '\r': case '\n': zoom_in(); break;
+    case 0x08: zoom_out(); break;
+    case 0x1B: if (scanning) finish_scan(); break;
+    case 'H': case '?': mi_info(win, 0, 0, NULL); break;
+    default: break;
+    }
+}
+
+static void __CDECL on_click(WINDOW *win, short buff[8])
+{
+    short mx = evnt.mx, my = evnt.my;
+    long i;
+    if (scanning) return;
+    for (i = 0; i < ncells; i++) {
+        const Cell *c = &cells[i];
+        if (mx >= c->x && mx < c->x + c->w && my >= c->y && my < c->y + c->h) {
+            if (evnt.mbut & 2) {
+                file_popup(c->n, mx, my);
+            } else {
+                select_node(c->n);
+                if (evnt.nb_click >= 2) zoom_in();
+            }
+            return;
+        }
+    }
+}
+
+int main(int argc, char **argv)
+{
+    ApplInit();
+    ApplSet(APS_FLAG, FLG_NOPAL, 1, 0, 0);
+    graf_handle(&cw, &ch, &bw, &bh);
+
+    if (Pgetpid() >= 0) {
+        use_mint = 1;
+        Pdomain(1);
+    }
+
+    mainwin = WindCreate(NAME | CLOSER | FULLER | MOVER | SIZER | INFO,
+                         app.x, app.y, app.w, app.h);
+    if (!mainwin) {
+        FormAlert(1, "[3][Kein Fenster frei!][ OK ]");
+        ApplExit();
+        return 1;
+    }
+    mainwin->w_min = 200;
+    mainwin->h_min = 120;
+    vh = mainwin->graf->handle;
+    setup_colors();
+    build_menu(app.w);
+
+    EvntAdd(mainwin, WM_REDRAW,    evnt_draw,  EV_BOT);
+    EvntAdd(mainwin, WM_MOVED,     on_geom,    EV_BOT);
+    EvntAdd(mainwin, WM_SIZED,     on_geom,    EV_BOT);
+    EvntAdd(mainwin, WM_REPOSED,   on_geom,    EV_BOT);
+    EvntAdd(mainwin, WM_FULLED,    on_geom,    EV_BOT);
+    EvntAdd(mainwin, WM_UNICONIFY, on_geom,    EV_BOT);
+    EvntAdd(mainwin, WM_ONTOP,     on_top,     EV_BOT);
+    EvntAdd(mainwin, WM_NEWTOP,    on_top,     EV_BOT);
+    EvntAdd(mainwin, WM_UNTOPPED,  on_untop,   EV_BOT);
+    EvntAdd(mainwin, WM_DESTROY,   on_destroy, EV_TOP);
+    EvntAttach(mainwin, WM_XKEYBD,  on_key);
+    EvntAttach(mainwin, WM_XBUTTON, on_click);
+    EvntAttach(NULL, WM_XTIMER, on_timer);
+    EvntAttach(NULL, AP_TERM,   on_apterm);
+
+    WindSetPtr(mainwin, WF_MENU, menutree, menu_unhilight);
+    ObjcAttachMenuFunc(mainwin, M_INFO,    mi_info,    NULL);
+    ObjcAttachMenuFunc(mainwin, M_OPEN,    mi_open,    NULL);
+    ObjcAttachMenuFunc(mainwin, M_PREF,    mi_pref,    NULL);
+    ObjcAttachMenuFunc(mainwin, M_QUIT,    mi_quit,    NULL);
+    ObjcAttachMenuFunc(mainwin, M_COLOR,   mi_color,   NULL);
+    ObjcAttachMenuFunc(mainwin, M_REFRESH, mi_refresh, NULL);
+    MenuIcheck(mainwin, M_COLOR, cushions_on);
+
+    update_title();
+    update_info();
+    {
+        short ww = (short)(app.w * 2 / 3), wh = (short)(app.h * 2 / 3);
+        WindOpen(mainwin, app.x + (app.w - ww) / 2, app.y + (app.h - wh) / 2, ww, wh);
+    }
+    relayout();
+
+    if (argc > 1 && argv[1][0]) start_scan(argv[1]);
+    else                        want_open = 1;
+
+    while (!endprog) {
+        int flags = MU_MESAG | MU_KEYBD | MU_BUTTON | (scanning ? MU_TIMER : 0);
+        evnt.bclick = 258; evnt.bmask = 3; evnt.bstate = 0;
+        evnt.timer = 0;
+        EvntWindom(flags);
+        if (want_open && !endprog) { want_open = 0; choose_folder(); }
+    }
+
+    free_tree(root);
+    free(cells);
+    ApplExit();
+    return 0;
+}
