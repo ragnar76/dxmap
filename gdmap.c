@@ -49,6 +49,13 @@ static int   scan_aborted;
  * layout plus any small ones (selection) that follow. */
 static int     show_timing;
 static clock_t t_sort, t_layout, t_draw, t_draw_shown;
+
+/* Scan breakdown (key D). t_step = time inside scan_step() (OS calls + our per-entry
+ * work), measured per folder for free in on_timer. t_node/t_hue = new_node() and the
+ * extension lookup inside it, measured per entry only if T was on when the scan
+ * started (probing), because the clock() calls themselves cost time. */
+static int     probing, probed;
+static clock_t t_step, t_node, t_hue;
 static short scan_mask = 0x17;
 static int   show_hidden = 1;
 
@@ -167,6 +174,7 @@ static unsigned char hue_for_name(const char *name)
 
 static Node *new_node(Node *parent, const char *name, int isdir, u64 size)
 {
+    clock_t ta = probing ? clock() : 0, tb;
     Node *n = (Node *)calloc(1, sizeof(Node));
     if (!n) return NULL;
     n->name = strdup(name);
@@ -175,7 +183,13 @@ static Node *new_node(Node *parent, const char *name, int isdir, u64 size)
     n->isdir  = (unsigned char)isdir;
     n->size   = size;
     if (parent) { n->next = parent->child; parent->child = n; }
+    tb = probing ? clock() : 0;
     if (!isdir) n->hue = hue_for_name(name);
+    if (probing) {
+        clock_t tc = isdir ? tb : clock();
+        t_hue  += tc - tb;
+        t_node += tc - ta;
+    }
     return n;
 }
 
@@ -870,6 +884,8 @@ static void start_scan(const char *p)
     todo = root;
     scanning = 1;
     scan_aborted = 0;
+    t_step = t_node = t_hue = 0;
+    probing = probed = show_timing;
     scan_t0 = clock();
     graf_mouse(BUSYBEE, 0L);
     update_title(); update_info(); redraw_all();
@@ -878,6 +894,7 @@ static void start_scan(const char *p)
 static void finish_scan(void)
 {
     scan_ticks = clock() - scan_t0;
+    probing = 0;
     scanning = 0; todo = NULL;
     graf_mouse(ARROW, 0L);
     if (root) {
@@ -1646,6 +1663,28 @@ static void menu_done(WINDOW *win, int ttl)
     ApplWrite(_AESapid, WM_REDRAW, win->handle, x, y, w, menutree[1].ob_height + 4);
 }
 
+static void show_scan_details(void)
+{
+    char b[400], a1[12], a2[12], a3[12], a4[12], a5[12];
+    const char *mode = !use_mint ? "Fsfirst" : use_dx ? "Dxreaddir" : "Dreaddir+Fxattr";
+    clock_t rest = scan_ticks > t_step ? scan_ticks - t_step : 0;
+
+    fmt_ticks(scan_ticks, a1);
+    fmt_ticks(rest, a5);
+    if (!probed) {
+        fmt_ticks(t_step, a2);
+        sprintf(b, "[1][Scan %s s, %s|Ordner lesen   %s s|GUI/Rest       %s s||"
+                   "Mehr: T vor dem Scan ein.][ OK ]", a1, mode, a2, a5);
+    } else {
+        fmt_ticks(t_step > t_node ? t_step - t_node : 0, a2);
+        fmt_ticks(t_node - t_hue, a3);
+        fmt_ticks(t_hue, a4);
+        sprintf(b, "[1][Scan %s s, %s|OS lesen       %s s|Knoten/malloc  %s s|"
+                   "Endung/Farbe   %s s|GUI/Rest       %s s][ OK ]", a1, mode, a2, a3, a4, a5);
+    }
+    FormAlert(1, b);
+}
+
 static void __CDECL menu_unhilight(WINDOW *win, short msg[])
 {
     menu_done(win, msg[3]);
@@ -1727,14 +1766,17 @@ static void __CDECL on_apterm(WINDOW *win, short buff[8])
 static void __CDECL on_timer(WINDOW *win, short buff[8])
 {
     static clock_t last_info;
-    clock_t t0;
+    clock_t t0, last, now;
 
     if (busy || !scanning) return;
-    t0 = clock();
+    t0 = last = clock();
     do {
         scan_step();
         scan_steps++;
-    } while (scanning && (clock_t)(clock() - t0) < SCAN_SLICE);
+        now = clock();
+        t_step += now - last;
+        last = now;
+    } while (scanning && (clock_t)(now - t0) < SCAN_SLICE);
 
     if (!scanning) { finish_scan(); return; }
     if ((clock_t)(t0 - last_info) >= INFO_EVERY) { last_info = t0; update_info(); }
@@ -1749,6 +1791,7 @@ static void __CDECL on_key(WINDOW *win, short buff[8])
     case 'O': if (!scanning) choose_folder(); break;
     case 'R': refresh(); break;
     case 'C': toggle_colors(); break;
+    case 'D': if (!scanning && root) show_scan_details(); break;
     case 'T': show_timing = !show_timing; t_draw_shown = t_draw; update_info(); break;
     case 'G': show_dirs = !show_dirs; relayout(); redraw_all(); break;
     case '\r': case '\n': zoom_in(); break;
