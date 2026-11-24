@@ -560,6 +560,21 @@ static void redraw_all(void)
     post_redraw(&w);
 }
 
+/* busy bee while the layout is computed and the cushions are drawn (about a second with
+ * many cells), arrow again afterwards unless a scan is still running */
+static void mouse_busy(int on)
+{
+    graf_mouse((on || scanning) ? BUSYBEE : ARROW, 0L);
+}
+
+static void relayout_redraw(void)
+{
+    mouse_busy(1);
+    relayout();
+    redraw_all();
+    mouse_busy(0);
+}
+
 static void bar_rect(GRECT *g)
 {
     g->g_x = work.g_x; g->g_w = work.g_w;
@@ -963,15 +978,14 @@ static void finish_scan(void)
     scan_ticks = clock() - scan_t0;
     probing = 0;
     scanning = 0; todo = NULL;
-    graf_mouse(ARROW, 0L);
+    mouse_busy(1);                          /* sort + layout + draw still to come */
     if (root) {
         clock_t t0 = clock();
         finish_dir(root);
         t_sort = clock() - t0;
     }
     update_title();
-    relayout();
-    redraw_all();
+    relayout_redraw();                      /* ends with the arrow */
     update_info();
 }
 
@@ -1006,7 +1020,7 @@ static void zoom_in(void)
     while (a && a->parent != view_root) a = a->parent;
     if (a && a->isdir) {
         view_root = a;
-        update_title(); relayout(); redraw_all(); update_info();
+        update_title(); relayout_redraw(); update_info();
     }
 }
 
@@ -1015,7 +1029,7 @@ static void zoom_out(void)
     if (scanning || !view_root || !view_root->parent) return;
     view_root = view_root->parent;
     sel = NULL;
-    update_title(); relayout(); redraw_all(); update_info();
+    update_title(); relayout_redraw(); update_info();
 }
 
 static void refresh(void)
@@ -1045,7 +1059,7 @@ static void settings(void)
             "(wirkt nach Aktualisieren)][R" AE "nder|Versteckte|Fertig]",
             show_dirs ? "an" : "aus", show_hidden ? "ja" : "nein");
         b = FormAlert(3, buf);
-        if (b == 1) { show_dirs = !show_dirs; relayout(); redraw_all(); }
+        if (b == 1) { show_dirs = !show_dirs; relayout_redraw(); }
         else if (b == 2) { show_hidden = !show_hidden; scan_mask = show_hidden ? 0x17 : 0x10; }
         else break;
     }
@@ -1213,8 +1227,7 @@ static void note_new_file(const char *dst, u64 size)
 static void finish_op(void)
 {
     update_title();
-    relayout();
-    redraw_all();
+    relayout_redraw();
     update_info();
 }
 
@@ -1803,9 +1816,10 @@ static void __CDECL on_geom(WINDOW *win, short buff[8])
             ncells = 0;
             layout_pending = 1;
             resize_t = clock();
+            mouse_busy(1);                  /* until the cushions are back */
+            redraw_all();
         } else
-            relayout();                     /* fuller, iconify etc.: one step, do it now */
-        redraw_all();
+            relayout_redraw();              /* fuller, iconify etc.: one step, do it now */
     } else if (w.g_x != work.g_x || w.g_y != work.g_y) {
         short dx = w.g_x - work.g_x;
         short dy = w.g_y - work.g_y;
@@ -1865,7 +1879,7 @@ static void __CDECL on_key(WINDOW *win, short buff[8])
     case 'C': toggle_colors(); break;
     case 'D': if (!scanning && root) show_scan_details(); break;
     case 'T': show_timing = !show_timing; t_draw_shown = t_draw; update_info(); break;
-    case 'G': show_dirs = !show_dirs; relayout(); redraw_all(); break;
+    case 'G': show_dirs = !show_dirs; relayout_redraw(); break;
     case '\r': case '\n': zoom_in(); break;
     case 0x08: zoom_out(); break;
     case 0x1B: if (scanning) { scan_aborted = 1; finish_scan(); } break;
@@ -1959,8 +1973,7 @@ int main(int argc, char **argv)
         evnt.timer = scanning ? 0 : 100;          /* pending display/layout: wake up in 100 ms */
         EvntWindom(flags);
         if (layout_pending && (clock_t)(clock() - resize_t) >= RESIZE_DELAY) {
-            relayout();
-            redraw_all();
+            relayout_redraw();
             update_info();
         }
         if (show_timing && !scanning && t_draw != t_draw_shown) {   /* redraw done: show its time */
