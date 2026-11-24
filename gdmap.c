@@ -43,6 +43,12 @@ static int   scanning, endprog, oom, cells_full, want_open;
 static u32   n_files, n_dirs, scan_steps;
 static clock_t scan_t0, scan_ticks;             /* scan start / duration, 200 Hz ticks */
 static int   scan_aborted;
+
+/* Measuring (key T): where does the time go? All values in 200 Hz ticks (5 ms).
+ * t_draw sums every redraw since the last layout, i.e. the full redraw after a
+ * layout plus any small ones (selection) that follow. */
+static int     show_timing;
+static clock_t t_sort, t_layout, t_draw, t_draw_shown;
 static short scan_mask = 0x17;
 static int   show_hidden = 1;
 
@@ -445,11 +451,14 @@ static void layout_dir(Node *d, short x, short y, short w, short h)
 
 static void relayout(void)
 {
+    clock_t t0 = clock();
     ncells = 0; cells_full = 0;
     if (!mainwin) return;
     WindGet(mainwin, WF_WORKXYWH, &work.g_x, &work.g_y, &work.g_w, &work.g_h);
     if (view_root)
         layout_dir(view_root, work.g_x, work.g_y, work.g_w, work.g_h);
+    t_layout = clock() - t0;
+    t_draw = 0;
 }
 
 static void post_redraw(const GRECT *g)
@@ -658,6 +667,7 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
     GRECT clip;
     short pxy[4];
     long i;
+    clock_t t0;
 
     clip.g_x = buff[4];
     clip.g_y = buff[5];
@@ -666,6 +676,7 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
 
     vh = win->graf->handle;
     if (clip.g_w <= 0 || clip.g_h <= 0) return;
+    t0 = clock();
 
     pxy[0] = clip.g_x; pxy[1] = clip.g_y;
     pxy[2] = clip.g_x + clip.g_w - 1; pxy[3] = clip.g_y + clip.g_h - 1;
@@ -701,6 +712,7 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
     }
 
     vs_clip(vh, 0, pxy);
+    t_draw += clock() - t0;
 }
 
 static void update_title(void)
@@ -717,6 +729,11 @@ static void update_title(void)
     if (mainwin) WindSetStr(mainwin, WF_NAME, title);
 }
 
+static void fmt_ticks(clock_t t, char *buf)       /* 200 Hz ticks -> "12.35" seconds */
+{
+    sprintf(buf, "%lu.%02lu", (unsigned long)(t / 200), (unsigned long)(t % 200 / 2));
+}
+
 static void update_info(void)
 {
     char path[PATHLEN], sz[40];
@@ -730,6 +747,13 @@ static void update_info(void)
                  n_files, n_dirs);
     else if (oom)
         snprintf(out, cap, " Speicher voll - Ergebnis unvollst" AE "ndig");
+    else if (show_timing && view_root) {
+        char a[12], b[12], c[12], d[12];
+        fmt_ticks(scan_ticks, a); fmt_ticks(t_sort, b);
+        fmt_ticks(t_layout, c);   fmt_ticks(t_draw, d);
+        snprintf(out, cap, " Scan %s  Sort %s  Layout %s  Zeichnen %s s  (%ld Kacheln)",
+                 a, b, c, d, ncells);
+    }
     else if (status_msg[0])
         snprintf(out, cap, " %s", status_msg);
     else if (sel) {
@@ -779,7 +803,11 @@ static void finish_scan(void)
     scan_ticks = clock() - scan_t0;
     scanning = 0; todo = NULL;
     graf_mouse(ARROW, 0L);
-    if (root) finish_dir(root);
+    if (root) {
+        clock_t t0 = clock();
+        finish_dir(root);
+        t_sort = clock() - t0;
+    }
     update_title();
     relayout();
     redraw_all();
@@ -1628,6 +1656,7 @@ static void __CDECL on_key(WINDOW *win, short buff[8])
     case 'O': if (!scanning) choose_folder(); break;
     case 'R': refresh(); break;
     case 'C': toggle_colors(); break;
+    case 'T': show_timing = !show_timing; t_draw_shown = t_draw; update_info(); break;
     case 'G': show_dirs = !show_dirs; relayout(); redraw_all(); break;
     case '\r': case '\n': zoom_in(); break;
     case 0x08: zoom_out(); break;
@@ -1715,10 +1744,20 @@ int main(int argc, char **argv)
     else                        want_open = 1;
 
     while (!endprog) {
-        int flags = MU_MESAG | MU_KEYBD | MU_BUTTON | (scanning ? MU_TIMER : 0);
+        int pending = show_timing && !scanning && t_draw != t_draw_shown;
+        int flags = MU_MESAG | MU_KEYBD | MU_BUTTON | ((scanning || pending) ? MU_TIMER : 0);
         evnt.bclick = 258; evnt.bmask = 3; evnt.bstate = 0;
-        evnt.timer = 0;
+        evnt.timer = scanning ? 0 : 100;          /* pending time display: wake up in 100 ms */
         EvntWindom(flags);
+        if (show_timing && !scanning && t_draw != t_draw_shown) {   /* redraw done: show its time */
+            static clock_t last;                  /* at most every 250 ms, so an AES that answers */
+            clock_t now = clock();                /* WF_INFO with a redraw can't start a loop     */
+            if ((clock_t)(now - last) >= 50) {
+                last = now;
+                t_draw_shown = t_draw;
+                update_info();
+            }
+        }
         if (want_open && !endprog) { want_open = 0; choose_folder(); }
     }
 
