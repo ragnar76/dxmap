@@ -172,13 +172,49 @@ static unsigned char hue_for_name(const char *name)
     return (unsigned char)(1 + hash % (NHUES - 1));
 }
 
+/* Block allocator for the tree: node and name come in ONE piece from 32 KB blocks
+ * instead of calloc() + strdup() per entry. Measured with key D this was about a third
+ * of the scan time (two mintlib mallocs per file). Single nodes are never freed: a
+ * removed node (file deleted/moved) just stays unused until the next scan, which drops
+ * all blocks at once (pool_free_all). */
+#define POOL_BLOCK  32768L
+#define POOL_ALIGN  ((long)sizeof(void *) > 4 ? 7L : 3L)   /* 4 bytes on 68k, 8 on 64 bit hosts (tests) */
+
+typedef struct pblock { struct pblock *next; long used, size; } PBlock;
+static PBlock *pool;
+
+static void *pool_alloc(long n)
+{
+    char *p;
+    n = (n + POOL_ALIGN) & ~POOL_ALIGN;                  /* keep nodes aligned */
+    if (!pool || pool->used + n > pool->size) {
+        long sz = (n + (long)sizeof(PBlock) > POOL_BLOCK) ? n + (long)sizeof(PBlock) : POOL_BLOCK;
+        PBlock *b = (PBlock *)malloc(sz);
+        if (!b) return NULL;
+        b->next = pool;
+        b->used = ((long)sizeof(PBlock) + POOL_ALIGN) & ~POOL_ALIGN;
+        b->size = sz;
+        pool = b;
+    }
+    p = (char *)pool + pool->used;
+    pool->used += n;
+    return p;
+}
+
+static void pool_free_all(void)
+{
+    while (pool) { PBlock *nx = pool->next; free(pool); pool = nx; }
+}
+
 static Node *new_node(Node *parent, const char *name, int isdir, u64 size)
 {
     clock_t ta = probing ? clock() : 0, tb;
-    Node *n = (Node *)calloc(1, sizeof(Node));
+    size_t len = strlen(name);
+    Node *n = (Node *)pool_alloc((long)(sizeof(Node) + len + 1));
     if (!n) return NULL;
-    n->name = strdup(name);
-    if (!n->name) { free(n); return NULL; }
+    memset(n, 0, sizeof(Node));
+    n->name = (char *)(n + 1);
+    memcpy(n->name, name, len + 1);
     n->parent = parent;
     n->isdir  = (unsigned char)isdir;
     n->size   = size;
@@ -193,14 +229,6 @@ static Node *new_node(Node *parent, const char *name, int isdir, u64 size)
     return n;
 }
 
-static void free_tree(Node *n)
-{
-    Node *c, *nx;
-    if (!n) return;
-    for (c = n->child; c; c = nx) { nx = c->next; free_tree(c); }
-    free(n->name);
-    free(n);
-}
 
 static Node *msort(Node *l)
 {
@@ -871,10 +899,11 @@ static void start_scan(const char *p)
     while (len > 0 && buf[len - 1] == '\\') buf[--len] = 0;
     if (len == 0) { buf[0] = 'A' + (char)Dgetdrv(); buf[1] = ':'; buf[2] = 0; }
 
-    free_tree(root);
+    root = view_root = sel = todo = NULL;           /* drop the old tree in one go */
+    ncells = 0;                                     /* cells point into the pool */
+    pool_free_all();
     status_msg[0] = 0;
-    root = view_root = sel = todo = NULL;
-    ncells = 0; oom = 0; cells_full = 0;
+    oom = 0; cells_full = 0;
     n_files = n_dirs = scan_steps = 0;
     strcpy(scan_root, buf);
 
@@ -1081,8 +1110,7 @@ static void node_remove(Node *n)
     for (pp = &p->child; *pp; pp = &(*pp)->next)
         if (*pp == n) { *pp = n->next; break; }
     n->next = NULL;
-    if (sel == n) sel = NULL;
-    free_tree(n);
+    if (sel == n) sel = NULL;                       /* memory stays in the pool until the next scan */
     if (n_files) n_files--;
     size_adjust(p, sz, 0);
 }
@@ -1897,7 +1925,7 @@ int main(int argc, char **argv)
         if (want_open && !endprog) { want_open = 0; choose_folder(); }
     }
 
-    free_tree(root);
+    pool_free_all();
     free(cells);
     ApplExit();
     return 0;
