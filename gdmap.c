@@ -61,8 +61,11 @@ static int   cushion_ok, cushions_on, show_dirs = 1;
 static short pen_hi[NHUES], pen_lo[NHUES], pen_top[NHUES];
 
 static char  title[PATHLEN + 64], scan_root[PATHLEN], status_msg[PATHLEN];
-static char  info_buf[2][PATHLEN + 64];
-static int   info_sel, busy, use_mint;
+/* own status bar at the bottom of the work area (the AES info line sits under the title,
+ * above the menu; Atari programs usually show their status at the bottom) */
+static char  status_l[PATHLEN + 64], status_r[96];
+static int   busy, use_mint;
+#define BAR_H  (ch + 6)
 
 #define M_INFO     8
 #define M_OPEN     10
@@ -455,8 +458,8 @@ static void relayout(void)
     ncells = 0; cells_full = 0;
     if (!mainwin) return;
     WindGet(mainwin, WF_WORKXYWH, &work.g_x, &work.g_y, &work.g_w, &work.g_h);
-    if (view_root)
-        layout_dir(view_root, work.g_x, work.g_y, work.g_w, work.g_h);
+    if (view_root && work.g_h > BAR_H)
+        layout_dir(view_root, work.g_x, work.g_y, work.g_w, (short)(work.g_h - BAR_H));
     t_layout = clock() - t0;
     t_draw = 0;
 }
@@ -475,6 +478,22 @@ static void redraw_all(void)
     if (!mainwin) return;
     WindGet(mainwin, WF_WORKXYWH, &w.g_x, &w.g_y, &w.g_w, &w.g_h);
     post_redraw(&w);
+}
+
+static void bar_rect(GRECT *g)
+{
+    g->g_x = work.g_x; g->g_w = work.g_w;
+    g->g_h = BAR_H;    g->g_y = work.g_y + work.g_h - BAR_H;
+}
+
+/* full redraw of the whole window (borders, menu, work) via the message queue, so it
+ * runs after the AES has finished removing a dialog or file selector */
+static void post_full_redraw(void)
+{
+    short x, y, w, h;
+    if (!mainwin) return;
+    wind_get(mainwin->handle, WF_CURRXYWH, &x, &y, &w, &h);
+    ApplWrite(_AESapid, WM_REDRAW, mainwin->handle, x, y, w, h);
 }
 
 static void redraw_node(const Node *n)
@@ -662,6 +681,53 @@ static void draw_sel(const Cell *c)
     }
 }
 
+/* draws text, cut at the front ("...tail") if longer than maxc characters */
+static void bar_text(short x, short y, const char *txt, int maxc)
+{
+    char buf[PATHLEN + 64];
+    int len = (int)strlen(txt);
+    if (maxc <= 0) return;
+    if (len > maxc) {
+        if (maxc <= 3) { buf[0] = 0; }
+        else { strcpy(buf, "..."); strcat(buf, txt + len - (maxc - 3)); }
+        txt = buf;
+    }
+    v_gtext(vh, x, y, (char *)txt);
+}
+
+/* status bar at the bottom of the work area; clip = pxy of the current redraw rectangle */
+static void draw_bar(const short *clip)
+{
+    GRECT b;
+    short pxy[4], d;
+    int maxc, rl, room;
+
+    bar_rect(&b);
+    if (b.g_w <= 0 || b.g_y > clip[3] || b.g_y + b.g_h - 1 < clip[1]) return;
+
+    vsf_interior(vh, FIS_SOLID);
+    vsf_color(vh, planes >= 4 ? 8 : 0);                 /* light grey, white on mono/4 colours */
+    pxy[0] = b.g_x; pxy[1] = b.g_y;
+    pxy[2] = b.g_x + b.g_w - 1; pxy[3] = b.g_y + b.g_h - 1;
+    vr_recfl(vh, pxy);
+    vsl_color(vh, 1);
+    pxy[3] = pxy[1];
+    v_pline(vh, 2, pxy);
+
+    vswr_mode(vh, MD_TRANS);
+    vst_color(vh, 1);
+    vst_alignment(vh, 0, 5, &d, &d);                    /* left, top */
+    maxc = (b.g_w - cw) / cw;
+    rl = (int)strlen(status_r);
+    if (rl > maxc) rl = 0;                              /* window too narrow: drop the timing */
+    room = maxc - (rl ? rl + 2 : 0);
+    bar_text((short)(b.g_x + cw / 2), (short)(b.g_y + 3), status_l, room);
+    if (rl)
+        v_gtext(vh, (short)(b.g_x + b.g_w - cw / 2 - rl * cw), (short)(b.g_y + 3), status_r);
+    vst_alignment(vh, 0, 0, &d, &d);
+    vswr_mode(vh, MD_REPLACE);
+}
+
 static void __CDECL evnt_draw(WINDOW *win, short buff[8])
 {
     GRECT clip;
@@ -702,7 +768,9 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
     }
 
     if (cushions_on) vsf_interior(vh, FIS_SOLID);
-    for (i = 0; i < ncells; i++) {
+    if (pxy[1] >= work.g_y + work.g_h - BAR_H) i = ncells;    /* only the status bar: skip cells */
+    else i = 0;
+    for (; i < ncells; i++) {
         const Cell *c = &cells[i];
         if (c->x > pxy[2] || c->y > pxy[3] ||
             c->x + c->w - 1 < pxy[0] || c->y + c->h - 1 < pxy[1])
@@ -711,6 +779,7 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
         if (c->n == sel) draw_sel(c);
     }
 
+    draw_bar(pxy);
     vs_clip(vh, 0, pxy);
     t_draw += clock() - t0;
 }
@@ -737,36 +806,44 @@ static void fmt_ticks(clock_t t, char *buf)       /* 200 Hz ticks -> "12.35" sec
 static void update_info(void)
 {
     char path[PATHLEN], sz[40];
-    char *out;
-    size_t cap = sizeof info_buf[0];
+    char *out = status_l;
+    size_t cap = sizeof status_l;
 
-    info_sel ^= 1;
-    out = info_buf[info_sel];
     if (scanning)
-        snprintf(out, cap, " Scanne: %lu Dateien, %lu Ordner   (Esc = Abbruch)",
+        snprintf(out, cap, "Scanne: %lu Dateien, %lu Ordner   (Esc = Abbruch)",
                  n_files, n_dirs);
     else if (oom)
-        snprintf(out, cap, " Speicher voll - Ergebnis unvollst" AE "ndig");
-    else if (show_timing && view_root) {
-        char a[12], b[12], c[12], d[12];
-        fmt_ticks(scan_ticks, a); fmt_ticks(t_sort, b);
-        fmt_ticks(t_layout, c);   fmt_ticks(t_draw, d);
-        snprintf(out, cap, " Scan %s  Sort %s  Layout %s  Zeichnen %s s  (%ld Kacheln)",
-                 a, b, c, d, ncells);
-    }
+        snprintf(out, cap, "Speicher voll - Ergebnis unvollst" AE "ndig");
     else if (status_msg[0])
-        snprintf(out, cap, " %s", status_msg);
+        snprintf(out, cap, "%s", status_msg);
     else if (sel) {
         build_path(sel, path, sizeof path);
         fmt_size(sel->size, sz);
-        snprintf(out, cap, " %s   %s", path, sz);
+        snprintf(out, cap, "%s   %s", path, sz);
     } else if (view_root)
-        snprintf(out, cap, " %lu Dateien, %lu Ordner   (Scan %lu.%lu s%s)", n_files, n_dirs,
+        snprintf(out, cap, "%lu Dateien, %lu Ordner   (Scan %lu.%lu s%s)", n_files, n_dirs,
                  (unsigned long)(scan_ticks / 200), (unsigned long)(scan_ticks % 200 / 20),
                  scan_aborted ? ", abgebrochen - unvollst" AE "ndig" : "");
     else
-        snprintf(out, cap, " Kein Ordner gew" AE "hlt");
-    if (mainwin) WindSetStr(mainwin, WF_INFO, out);
+        snprintf(out, cap, "Kein Ordner gew" AE "hlt");
+
+    /* timing (key T) goes to the right part, so the file name stays visible */
+    status_r[0] = 0;
+    if (show_timing && view_root && !scanning) {
+        char a[12], b[12], c[12], d[12];
+        fmt_ticks(scan_ticks, a); fmt_ticks(t_sort, b);
+        fmt_ticks(t_layout, c);   fmt_ticks(t_draw, d);
+        snprintf(status_r, sizeof status_r, "Scan %s  Sort %s  Layout %s  Zeichnen %s s  (%ld)",
+                 a, b, c, d, ncells);
+    }
+
+    if (mainwin && work.g_w > 0) {
+        GRECT g;
+        clock_t keep = t_draw;          /* drawing the bar is not part of the measurement */
+        bar_rect(&g);
+        post_redraw(&g);
+        t_draw = keep;
+    }
 }
 
 static void start_scan(const char *p)
@@ -817,12 +894,13 @@ static void finish_scan(void)
 static void choose_folder(void)
 {
     static char fpath[PATHLEN], fname[260];        /* FSLX writes up to 65, fsel_exinput may write long names */
-    int len;
+    int len, r;
 
     if (!fpath[0]) sprintf(fpath, "%c:\\", 'A' + (int)Dgetdrv());
     fname[0] = 0;
-    if (!FselInput(fpath, fname, "*.*", APPNAME ": Ordner w" AE "hlen", NULL, NULL))
-        return;
+    r = FselInput(fpath, fname, "*.*", APPNAME ": Ordner w" AE "hlen", NULL, NULL);
+    post_full_redraw();                            /* area under the file selector */
+    if (!r) return;
     len = (int)strlen(fpath);
     if (len > 0) start_scan(fpath);
 }
@@ -1337,7 +1415,9 @@ static int choose_dest_fsel(const Node *n, const char *ttl, char *dst, int max)
         if (len > 0 && dpath[len - 1] != '\\') { dpath[len++] = '\\'; dpath[len] = 0; }
     }
     strncpy(dname, n->name, sizeof dname - 1); dname[sizeof dname - 1] = 0;
-    if (!FselInput(dpath, dname, "*.*", (char *)ttl, NULL, NULL)) return 0;
+    len = FselInput(dpath, dname, "*.*", (char *)ttl, NULL, NULL);
+    post_full_redraw();
+    if (!len) return 0;
     if (!dname[0]) return 0;
 
     strncpy(lastdest, dpath, sizeof lastdest - 1); lastdest[sizeof lastdest - 1] = 0;
@@ -1553,27 +1633,40 @@ static void build_menu(int scrw)
     if (!cushion_ok) menutree[M_COLOR].ob_state |= OS_DISABLED;
 }
 
+/* After a menu entry: un-hilight the title and redraw the WHOLE menu row (plus a few
+ * pixels below) via the message queue. WinDom's frm_menu restores the drop-down
+ * background with a 10 pixel margin that reaches into the menu row (saved while the
+ * title was inverted), and MenuTnormal() only redraws the exact title rectangle, so
+ * remnants could stay (3D AES draw titles slightly larger). */
+static void menu_done(WINDOW *win, int ttl)
+{
+    short x, y, w, h;
+    if (ttl > 0) menutree[ttl].ob_state &= ~OS_SELECTED;
+    wind_get(win->handle, WF_WORKXYWH, &x, &y, &w, &h);     /* AES work area incl. menu */
+    ApplWrite(_AESapid, WM_REDRAW, win->handle, x, y, w, menutree[1].ob_height + 4);
+}
+
 static void __CDECL menu_unhilight(WINDOW *win, short msg[])
 {
-    MenuTnormal(win, msg[3], 1);
+    menu_done(win, msg[3]);
 }
 
 static void __CDECL mi_info(WINDOW *win, int index, int ttl, void *data)
 {
     FormAlert(1, "[1][" APPNAME " f" UE "r Atari|Treemap der Plattenbelegung|"
                  "Rechtsklick auf Datei:|Kopieren, Verschieben, L" OE "schen][ OK ]");
-    MenuTnormal(win, ttl, 1);
+    menu_done(win, ttl);
 }
 
 static void __CDECL mi_open(WINDOW *win, int index, int ttl, void *data)
 {
-    MenuTnormal(win, ttl, 1);
+    menu_done(win, ttl);
     if (!scanning) choose_folder();
 }
 
 static void __CDECL mi_pref(WINDOW *win, int index, int ttl, void *data)
 {
-    MenuTnormal(win, ttl, 1);
+    menu_done(win, ttl);
     settings();
 }
 
@@ -1584,13 +1677,13 @@ static void __CDECL mi_quit(WINDOW *win, int index, int ttl, void *data)
 
 static void __CDECL mi_color(WINDOW *win, int index, int ttl, void *data)
 {
-    MenuTnormal(win, ttl, 1);
+    menu_done(win, ttl);
     toggle_colors();
 }
 
 static void __CDECL mi_refresh(WINDOW *win, int index, int ttl, void *data)
 {
-    MenuTnormal(win, ttl, 1);
+    menu_done(win, ttl);
     refresh();
 }
 
@@ -1698,7 +1791,7 @@ int main(int argc, char **argv)
         Pdomain(1);
     }
 
-    mainwin = WindCreate(NAME | CLOSER | FULLER | MOVER | SIZER | INFO,
+    mainwin = WindCreate(NAME | CLOSER | FULLER | MOVER | SIZER,
                          app.x, app.y, app.w, app.h);
     if (!mainwin) {
         FormAlert(1, "[3][Kein Fenster frei!][ OK ]");
@@ -1750,8 +1843,8 @@ int main(int argc, char **argv)
         evnt.timer = scanning ? 0 : 100;          /* pending time display: wake up in 100 ms */
         EvntWindom(flags);
         if (show_timing && !scanning && t_draw != t_draw_shown) {   /* redraw done: show its time */
-            static clock_t last;                  /* at most every 250 ms, so an AES that answers */
-            clock_t now = clock();                /* WF_INFO with a redraw can't start a loop     */
+            static clock_t last;                  /* at most every 250 ms */
+            clock_t now = clock();
             if ((clock_t)(now - last) >= 50) {
                 last = now;
                 t_draw_shown = t_draw;
