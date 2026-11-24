@@ -1737,7 +1737,9 @@ static void build_menu(int scrw)
 static void menu_done(WINDOW *win, int ttl)
 {
     short x, y, w, h;
-    if (ttl > 0) menutree[ttl].ob_state &= ~OS_SELECTED;
+    /* WindSetPtr(WF_MENU) works on a COPY of menutree (ObjcDup), so the state has to be
+     * cleared in win->menu.root, not in menutree[] */
+    if (ttl > 0 && win->menu.root) win->menu.root[ttl].ob_state &= ~OS_SELECTED;
     wind_get(win->handle, WF_WORKXYWH, &x, &y, &w, &h);     /* AES work area incl. menu */
     ApplWrite(_AESapid, WM_REDRAW, win->handle, x, y, w, menutree[1].ob_height + 4);
 }
@@ -1762,6 +1764,31 @@ static void show_scan_details(void)
                    "Endung/Farbe   %s s|GUI/Rest       %s s][ OK ]", a1, mode, a2, a3, a4, a5);
     }
     FormAlert(1, b);
+}
+
+/* WinDom's frm_menu draws the drop-down boxes straight onto the screen and puts the
+ * saved background back with vro_cpyfm afterwards, without any WM_REDRAW. Under XaAES
+ * (ARAnyM) that left a stripe of old pixels under the menu, even when a menu was only
+ * opened and closed. So: the hilight hook notes that a menu was opened, and once
+ * frm_menu has returned the main loop sends a WM_REDRAW for everything a drop-down
+ * (plus WinDom's 10 pixel margin) can have covered. */
+static int menu_used;
+
+static void __CDECL menu_hilight(APPvar *ap, WINDOW *win, int title, int item)
+{
+    menu_used = 1;
+}
+
+static void redraw_menu_area(WINDOW *win)
+{
+    static const int boxes[] = { 7, 9, 15 };
+    short x, y, w, h;
+    int i, hmax = 0;
+    for (i = 0; i < 3; i++)
+        if (menutree[boxes[i]].ob_height > hmax) hmax = menutree[boxes[i]].ob_height;
+    wind_get(win->handle, WF_WORKXYWH, &x, &y, &w, &h);       /* AES work area incl. menu */
+    h = menutree[1].ob_height + 1 + hmax + 10 + 4;            /* bar, line, box, margin, frame */
+    ApplWrite(_AESapid, WM_REDRAW, win->handle, x, y, w, h);
 }
 
 static void __CDECL menu_unhilight(WINDOW *win, short msg[])
@@ -1946,6 +1973,7 @@ int main(int argc, char **argv)
     EvntAttach(NULL, AP_TERM,   on_apterm);
 
     WindSetPtr(mainwin, WF_MENU, menutree, menu_unhilight);
+    WindSetPtr(mainwin, WF_HILIGHT, (void *)menu_hilight, NULL);
     ObjcAttachMenuFunc(mainwin, M_INFO,    mi_info,    NULL);
     ObjcAttachMenuFunc(mainwin, M_OPEN,    mi_open,    NULL);
     ObjcAttachMenuFunc(mainwin, M_PREF,    mi_pref,    NULL);
@@ -1972,6 +2000,10 @@ int main(int argc, char **argv)
         evnt.bclick = 258; evnt.bmask = 3; evnt.bstate = 0;
         evnt.timer = scanning ? 0 : 100;          /* pending display/layout: wake up in 100 ms */
         EvntWindom(flags);
+        if (menu_used && !endprog) {             /* a drop-down was open: repair under it */
+            menu_used = 0;
+            redraw_menu_area(mainwin);
+        }
         if (layout_pending && (clock_t)(clock() - resize_t) >= RESIZE_DELAY) {
             relayout_redraw();
             update_info();
