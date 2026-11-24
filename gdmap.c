@@ -55,6 +55,14 @@ static clock_t t_sort, t_layout, t_draw, t_draw_shown;
  * extension lookup inside it, measured per entry only if T was on when the scan
  * started (probing), because the clock() calls themselves cost time. */
 static int     probing, probed;
+
+/* Debounced resizing: with live resizing the AES sends WM_SIZED for every step while the
+ * user drags. Layout + full redraw take about a second with ~60000 cells, so the window
+ * would lag behind. Instead the window is cleared and the layout runs once no further
+ * WM_SIZED came for RESIZE_DELAY ticks. */
+#define RESIZE_DELAY  60    /* 300 ms */
+static int     layout_pending;
+static clock_t resize_t;
 static clock_t t_step, t_node, t_hue;
 static short scan_mask = 0x17;
 static int   show_hidden = 1;
@@ -527,6 +535,7 @@ static void relayout(void)
 {
     clock_t t0 = clock();
     ncells = 0; cells_full = 0;
+    layout_pending = 0;
     if (!mainwin) return;
     WindGet(mainwin, WF_WORKXYWH, &work.g_x, &work.g_y, &work.g_w, &work.g_h);
     if (view_root && work.g_h > BAR_H)
@@ -829,7 +838,7 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
 
     if (ncells == 0) {
         vst_color(vh, 1);
-        if (scanning)
+        if (scanning || layout_pending)
             ;
         else if (view_root)
             v_gtext(vh, work.g_x + cw, work.g_y + 2 * ch, "(leer)");
@@ -1789,7 +1798,13 @@ static void __CDECL on_geom(WINDOW *win, short buff[8])
     long i;
     WindGet(win, WF_WORKXYWH, &w.g_x, &w.g_y, &w.g_w, &w.g_h);
     if (w.g_w != work.g_w || w.g_h != work.g_h) {
-        relayout();
+        if (buff[0] == WM_SIZED) {          /* clear now, layout when the user stops */
+            work = w;
+            ncells = 0;
+            layout_pending = 1;
+            resize_t = clock();
+        } else
+            relayout();                     /* fuller, iconify etc.: one step, do it now */
         redraw_all();
     } else if (w.g_x != work.g_x || w.g_y != work.g_y) {
         short dx = w.g_x - work.g_x;
@@ -1938,10 +1953,16 @@ int main(int argc, char **argv)
 
     while (!endprog) {
         int pending = show_timing && !scanning && t_draw != t_draw_shown;
-        int flags = MU_MESAG | MU_KEYBD | MU_BUTTON | ((scanning || pending) ? MU_TIMER : 0);
+        int flags = MU_MESAG | MU_KEYBD | MU_BUTTON |
+                    ((scanning || pending || layout_pending) ? MU_TIMER : 0);
         evnt.bclick = 258; evnt.bmask = 3; evnt.bstate = 0;
-        evnt.timer = scanning ? 0 : 100;          /* pending time display: wake up in 100 ms */
+        evnt.timer = scanning ? 0 : 100;          /* pending display/layout: wake up in 100 ms */
         EvntWindom(flags);
+        if (layout_pending && (clock_t)(clock() - resize_t) >= RESIZE_DELAY) {
+            relayout();
+            redraw_all();
+            update_info();
+        }
         if (show_timing && !scanning && t_draw != t_draw_shown) {   /* redraw done: show its time */
             static clock_t last;                  /* at most every 250 ms */
             clock_t now = clock();
