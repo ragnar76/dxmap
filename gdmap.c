@@ -1082,32 +1082,209 @@ static void set_min_px(int step)               /* step -1 / +1 through min_steps
     update_info();
 }
 
-/* Interim settings via alerts (a real dialog is still to come). A GEM alert has at most
- * three buttons, so the minimum size is on a second page. */
+/* ---------------------------------------------------------------------------------
+ * Settings window: a WinDom form in its own window, built in code like the menu.
+ * Checkboxes are a G_BOXCHAR square ('X' or blank) plus a clickable label, both
+ * TOUCHEXIT. WinDom's own 3D checkbox type (DCRBUTTON) is drawn by xobjc.ldg and would
+ * fall back to nothing if that LDG is missing, so plain AES objects are used.
+ * Changes go to the t_* copies; OK applies them, Sichern applies and writes X-MAP.INF,
+ * Abbruch (or the closer) throws them away.
+ * ------------------------------------------------------------------------------- */
+enum { S_ROOT, S_T1, S_CB_DIRS, S_L_DIRS, S_CB_CUSH, S_L_CUSH, S_L_MIN, S_POP_MIN,
+       S_T2, S_CB_HID, S_L_HID, S_NOTE, S_SAVE, S_CANCEL, S_OK, S_NOBJ };
+
+static OBJECT  settree[S_NOBJ];
+static WINDOW *setwin;
+static int     t_dirs, t_cush, t_hid, t_min;
+static char    pop_txt[32];
+static char    inf_path[PATHLEN];
+
+static void sobj(int i, int next, int head, int tail, int type, int flags, int state,
+                 long spec, const char *str, int x, int y, int w, int h)
+{
+    OBJECT *o = &settree[i];
+    o->ob_next = next; o->ob_head = head; o->ob_tail = tail;
+    o->ob_type = type; o->ob_flags = flags; o->ob_state = state;
+    if (str) o->ob_spec.free_string = (char *)str; else o->ob_spec.index = spec;
+    o->ob_x = x; o->ob_y = y; o->ob_width = w; o->ob_height = h;
+}
+
+#define CB_SPEC(on)  ((((long)((on) ? 'X' : ' ')) << 24) | 0x00011100L)
+
+static void set_pop_txt(int px)
+{
+    sprintf(pop_txt, " %d Pixel \002", px);              /* \002 = arrow down (Atari font) */
+}
+
+static void build_settings(void)
+{
+    static char t1[] = "Darstellung", t2[] = "Scan";
+    static char l_dirs[] = "Ordnerr" AE "nder anzeigen";
+    static char l_cush[] = "Kissen-Schattierung (Farbmodus)";
+    static char l_min[]  = "Mindestgr" OE "\236e:";
+    static char l_hid[]  = "Versteckte Dateien mitz" AE "hlen";
+    static char note[]   = "(gilt beim n" AE "chsten Scan)";
+    static char b_save[] = "Sichern", b_cancel[] = "Abbruch", b_ok[] = "OK";
+    int Y = ch / 2;                                       /* half a text line */
+    int cb = ch;                                          /* checkbox: square */
+    int lx = 4 * cw + cb;                                 /* label x */
+    int bh = ch + 4;
+    int W = 40 * cw, H = 27 * Y + bh;
+    int cflag = cushion_ok ? 0 : OS_DISABLED;
+
+    sobj(S_ROOT,   -1, S_T1, S_OK, G_BOX, OF_NONE, OS_NORMAL, 0x00001100L, NULL, 0, 0, W, H);
+    sobj(S_T1,      S_CB_DIRS, -1, -1, G_STRING, OF_NONE, OS_NORMAL, 0, t1, 2 * cw, 2 * Y, 11 * cw, ch);
+    sobj(S_CB_DIRS, S_L_DIRS,  -1, -1, G_BOXCHAR, OF_TOUCHEXIT, OS_NORMAL, CB_SPEC(0), NULL, 3 * cw, 5 * Y, cb, cb);
+    sobj(S_L_DIRS,  S_CB_CUSH, -1, -1, G_STRING, OF_TOUCHEXIT, OS_NORMAL, 0, l_dirs, lx, 5 * Y, 30 * cw, ch);
+    sobj(S_CB_CUSH, S_L_CUSH,  -1, -1, G_BOXCHAR, OF_TOUCHEXIT, cflag, CB_SPEC(0), NULL, 3 * cw, 8 * Y, cb, cb);
+    sobj(S_L_CUSH,  S_L_MIN,   -1, -1, G_STRING, OF_TOUCHEXIT, cflag, 0, l_cush, lx, 8 * Y, 31 * cw, ch);
+    sobj(S_L_MIN,   S_POP_MIN, -1, -1, G_STRING, OF_NONE, OS_NORMAL, 0, l_min, 3 * cw, 11 * Y + 2, 14 * cw, ch);
+    sobj(S_POP_MIN, S_T2,      -1, -1, G_BUTTON, OF_TOUCHEXIT, OS_SHADOWED, 0, pop_txt, 18 * cw, 11 * Y, 13 * cw, ch + 4);
+    sobj(S_T2,      S_CB_HID,  -1, -1, G_STRING, OF_NONE, OS_NORMAL, 0, t2, 2 * cw, 15 * Y, 4 * cw, ch);
+    sobj(S_CB_HID,  S_L_HID,   -1, -1, G_BOXCHAR, OF_TOUCHEXIT, OS_NORMAL, CB_SPEC(0), NULL, 3 * cw, 18 * Y, cb, cb);
+    sobj(S_L_HID,   S_NOTE,    -1, -1, G_STRING, OF_TOUCHEXIT, OS_NORMAL, 0, l_hid, lx, 18 * Y, 28 * cw, ch);
+    sobj(S_NOTE,    S_SAVE,    -1, -1, G_STRING, OF_NONE, OS_NORMAL, 0, note, lx, 20 * Y, 26 * cw, ch);
+    sobj(S_SAVE,    S_CANCEL,  -1, -1, G_BUTTON, OF_SELECTABLE | OF_EXIT, OS_NORMAL, 0, b_save, 2 * cw, 24 * Y, 10 * cw, bh);
+    sobj(S_CANCEL,  S_OK,      -1, -1, G_BUTTON, OF_SELECTABLE | OF_EXIT, OS_NORMAL, 0, b_cancel, 15 * cw, 24 * Y, 10 * cw, bh);
+    sobj(S_OK,      S_ROOT,    -1, -1, G_BUTTON, OF_SELECTABLE | OF_EXIT | OF_DEFAULT | OF_LASTOB,
+         OS_NORMAL, 0, b_ok, 28 * cw, 24 * Y, 10 * cw, bh);
+}
+
+static void settings_to_tree(void)
+{
+    settree[S_CB_DIRS].ob_spec.index = CB_SPEC(t_dirs);
+    settree[S_CB_CUSH].ob_spec.index = CB_SPEC(t_cush);
+    settree[S_CB_HID].ob_spec.index  = CB_SPEC(t_hid);
+    set_pop_txt(t_min);
+}
+
+static void apply_settings(void)
+{
+    int relay = (t_dirs != show_dirs) || (t_min != min_px);
+    int recolor = cushion_ok && (t_cush != cushions_on);
+
+    show_dirs   = t_dirs;
+    min_px      = t_min;
+    show_hidden = t_hid;
+    scan_mask   = show_hidden ? 0x17 : 0x10;
+    if (recolor) {
+        cushions_on = t_cush;
+        MenuIcheck(mainwin, M_COLOR, cushions_on);
+    }
+    if (relay) relayout_redraw();
+    else if (recolor) redraw_all();
+}
+
+/* X-MAP.INF: plain "key=value" lines, next to the program (start directory) */
+static void load_settings(void)
+{
+    char line[80], key[24];
+    int v;
+    FILE *f = fopen(inf_path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%23[^=]=%d", key, &v) == 2) {
+            if      (!strcmp(key, "dirs"))     show_dirs = v != 0;
+            else if (!strcmp(key, "cushions")) { if (cushion_ok) cushions_on = v != 0; }
+            else if (!strcmp(key, "hidden"))   show_hidden = v != 0;
+            else if (!strcmp(key, "minpx")) {
+                int i;
+                for (i = 0; i < NMIN; i++) if (min_steps[i] == v) min_px = v;
+            }
+        }
+    fclose(f);
+    scan_mask = show_hidden ? 0x17 : 0x10;
+}
+
+static int save_settings(void)
+{
+    FILE *f = fopen(inf_path, "w");
+    if (!f) return 0;
+    fprintf(f, "; " APPNAME " settings\ndirs=%d\ncushions=%d\nhidden=%d\nminpx=%d\n",
+            show_dirs, cushions_on, show_hidden, min_px);
+    return fclose(f) == 0;
+}
+
+static void close_settings(WINDOW *win)
+{
+    ApplWrite(_AESapid, WM_DESTROY, win->handle, 0, 0, 0, 0);
+}
+
+static void __CDECL set_toggle(WINDOW *win, int index, int mode, void *data)
+{
+    int *var = (int *)data;
+    int cbox = (index == S_L_DIRS || index == S_CB_DIRS) ? S_CB_DIRS :
+               (index == S_L_CUSH || index == S_CB_CUSH) ? S_CB_CUSH : S_CB_HID;
+    if (settree[cbox].ob_state & OS_DISABLED) return;
+    *var = !*var;
+    settree[cbox].ob_spec.index = CB_SPEC(*var);
+    ObjcDraw(OC_FORM, win, cbox, 0);
+}
+
+static void __CDECL set_popup(WINDOW *win, int index, int mode, void *data)
+{
+    static char items[NMIN][28];
+    static char *list[NMIN];
+    short x, y;
+    int i, cur = 0, r;
+
+    for (i = 0; i < NMIN; i++) {
+        sprintf(items[i], "  %2d Pixel%s  ", min_steps[i], min_steps[i] == 1 ? " (alles einzeln)" : "");
+        list[i] = items[i];
+        if (min_steps[i] == t_min) cur = i;
+    }
+    objc_offset(settree, index, &x, &y);
+    r = MenuPopUp(list, x, y, NMIN, -1, cur + 1, P_LIST | P_WNDW | P_CHCK);
+    if (r >= 1 && r <= NMIN) {
+        t_min = min_steps[r - 1];
+        set_pop_txt(t_min);
+    }
+    ObjcDraw(OC_FORM, win, index, 0);
+}
+
+static void __CDECL set_button(WINDOW *win, int index, int mode, void *data)
+{
+    ObjcChange(OC_FORM, win, index, OS_NORMAL, TRUE);
+    if (index == S_CANCEL) { close_settings(win); return; }
+    apply_settings();
+    if (index == S_SAVE) {
+        if (save_settings())
+            snprintf(status_msg, sizeof status_msg, "Einstellungen gesichert");
+        else
+            snprintf(status_msg, sizeof status_msg, "Konnte %s nicht schreiben", inf_path);
+        update_info();
+        return;                                           /* Sichern keeps the window open */
+    }
+    close_settings(win);
+}
+
+static void __CDECL setwin_destroy(WINDOW *win, short buff[8])
+{
+    setwin = NULL;
+}
+
 static void settings(void)
 {
-    char buf[400];
-    int b, page = 0;
-    for (;;) {
-        if (page == 0) {
-            sprintf(buf,
-                "[2][Einstellungen:|Ordnerr" AE "nder: %s|Versteckte Dateien: %s|"
-                "(wirkt nach Aktualisieren)][R" AE "nder|Versteckte|Weiter >]",
-                show_dirs ? "an" : "aus", show_hidden ? "ja" : "nein");
-            b = FormAlert(3, buf);
-            if (b == 1) { show_dirs = !show_dirs; relayout_redraw(); }
-            else if (b == 2) { show_hidden = !show_hidden; scan_mask = show_hidden ? 0x17 : 0x10; }
-            else page = 1;
-        } else {
-            sprintf(buf,
-                "[2][Mindestgr" OE "\236e: %d Pixel|Kleinere Fl" AE "chen werden|"
-                "zusammengefasst (1 = aus).|Auch mit Tasten + und -][ - | + |Fertig]", min_px);
-            b = FormAlert(3, buf);
-            if (b == 1) set_min_px(-1);
-            else if (b == 2) set_min_px(+1);
-            else break;
-        }
+    if (setwin) {                                         /* already open: bring it to front */
+        WindSet(setwin, WF_TOP, 0, 0, 0, 0);
+        return;
     }
+    t_dirs = show_dirs; t_cush = cushions_on; t_hid = show_hidden; t_min = min_px;
+    build_settings();
+    settings_to_tree();
+    setwin = FormCreate(settree, WAT_FORM, NULL, APPNAME ": Einstellungen", NULL, TRUE, FALSE);
+    if (!setwin) return;
+    EvntAdd(setwin, WM_DESTROY, setwin_destroy, EV_TOP);
+    ObjcAttachFormFunc(setwin, S_CB_DIRS, set_toggle, &t_dirs);
+    ObjcAttachFormFunc(setwin, S_L_DIRS,  set_toggle, &t_dirs);
+    ObjcAttachFormFunc(setwin, S_CB_CUSH, set_toggle, &t_cush);
+    ObjcAttachFormFunc(setwin, S_L_CUSH,  set_toggle, &t_cush);
+    ObjcAttachFormFunc(setwin, S_CB_HID,  set_toggle, &t_hid);
+    ObjcAttachFormFunc(setwin, S_L_HID,   set_toggle, &t_hid);
+    ObjcAttachFormFunc(setwin, S_POP_MIN, set_popup, NULL);
+    ObjcAttachFormFunc(setwin, S_SAVE,    set_button, NULL);
+    ObjcAttachFormFunc(setwin, S_CANCEL,  set_button, NULL);
+    ObjcAttachFormFunc(setwin, S_OK,      set_button, NULL);
 }
 
 static char lastdest[PATHLEN];
@@ -2005,6 +2182,13 @@ int main(int argc, char **argv)
     mainwin->h_min = 120;
     vh = mainwin->graf->handle;
     setup_colors();
+    {                                               /* X-MAP.INF in the start directory */
+        char d[PATHLEN];
+        d[0] = 0;
+        Dgetpath(d, 0);
+        snprintf(inf_path, sizeof inf_path, "%c:%s\\X-MAP.INF", 'A' + (int)Dgetdrv(), d);
+        load_settings();
+    }
     build_menu(app.w);
 
     EvntAdd(mainwin, WM_REDRAW,    evnt_draw,  EV_BOT);
