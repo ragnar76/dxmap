@@ -73,6 +73,15 @@ static GRECT work;
 
 static short planes;
 static int   cushion_ok, cushions_on, show_dirs = 1;
+
+/* Minimum size (settings, keys + and -): areas with a side shorter than min_px pixels
+ * are not split any further. A folder that small becomes one grey cell, and the rest of
+ * a folder whose remaining strip got that thin is lumped into one cell. Those areas were
+ * only pixel crumbs anyway, but the layout used to compute every single file in them.
+ * 1 = no limit (every file its own cell). */
+static const int min_steps[] = { 1, 2, 3, 4, 6, 8, 12, 16 };
+#define NMIN  ((int)(sizeof min_steps / sizeof min_steps[0]))
+static int   min_px = 2;
 static short pen_hi[NHUES], pen_lo[NHUES], pen_top[NHUES];
 
 static char  title[PATHLEN + 64], scan_root[PATHLEN], status_msg[PATHLEN];
@@ -456,6 +465,7 @@ static void place(Node *n, short x, short y, short w, short h)
 {
     if (w <= 0 || h <= 0) return;
     if (n->isdir) {
+        if (w < min_px || h < min_px) { add_cell(n, x, y, w, h); return; }   /* too small: one cell */
         if (show_dirs && w >= 10 && h >= 10) { x++; y++; w -= 2; h -= 2; }
         layout_dir(n, x, y, w, h);
     } else
@@ -479,6 +489,10 @@ static void layout_dir(Node *d, short x, short y, short w, short h)
 
     c = d->child;
     while (c && WT(c) > 0 && R > 0 && w > 0 && h > 0) {
+        if (w < min_px || h < min_px) {          /* remaining strip too thin: lump the rest */
+            add_cell(d, x, y, w, h);
+            break;
+        }
         u64  A    = (u64)(u32)w * (u32)h;
         long side = (w >= h) ? h : w;
         long len  = (w >= h) ? w : h;
@@ -508,6 +522,10 @@ static void layout_dir(Node *d, short x, short y, short w, short h)
             t = ((long)S + side / 2) / side;
             if (t < 1) t = 1;
             if (t > len) t = len;
+        }
+        if (t < min_px) {                        /* row thinner than the minimum: all that is */
+            add_cell(d, x, y, w, h);             /* left in this folder is crumbs, one cell   */
+            break;
         }
 
         pos = 0; cum = 0;
@@ -1049,19 +1067,46 @@ static void toggle_colors(void)
     redraw_all();
 }
 
+static void set_min_px(int step)               /* step -1 / +1 through min_steps */
+{
+    int i = 0;
+    while (i < NMIN - 1 && min_steps[i] < min_px) i++;
+    i += step;
+    if (i < 0) i = 0;
+    if (i >= NMIN) i = NMIN - 1;
+    if (min_steps[i] == min_px) return;
+    min_px = min_steps[i];
+    snprintf(status_msg, sizeof status_msg, "Mindestgr" OE "\236e: %d Pixel%s", min_px,
+             min_px == 1 ? " (alles einzeln)" : "");
+    relayout_redraw();
+    update_info();
+}
+
+/* Interim settings via alerts (a real dialog is still to come). A GEM alert has at most
+ * three buttons, so the minimum size is on a second page. */
 static void settings(void)
 {
     char buf[400];
-    int b;
+    int b, page = 0;
     for (;;) {
-        sprintf(buf,
-            "[2][Einstellungen:|Ordnerr" AE "nder: %s|Versteckte Dateien: %s|"
-            "(wirkt nach Aktualisieren)][R" AE "nder|Versteckte|Fertig]",
-            show_dirs ? "an" : "aus", show_hidden ? "ja" : "nein");
-        b = FormAlert(3, buf);
-        if (b == 1) { show_dirs = !show_dirs; relayout_redraw(); }
-        else if (b == 2) { show_hidden = !show_hidden; scan_mask = show_hidden ? 0x17 : 0x10; }
-        else break;
+        if (page == 0) {
+            sprintf(buf,
+                "[2][Einstellungen:|Ordnerr" AE "nder: %s|Versteckte Dateien: %s|"
+                "(wirkt nach Aktualisieren)][R" AE "nder|Versteckte|Weiter >]",
+                show_dirs ? "an" : "aus", show_hidden ? "ja" : "nein");
+            b = FormAlert(3, buf);
+            if (b == 1) { show_dirs = !show_dirs; relayout_redraw(); }
+            else if (b == 2) { show_hidden = !show_hidden; scan_mask = show_hidden ? 0x17 : 0x10; }
+            else page = 1;
+        } else {
+            sprintf(buf,
+                "[2][Mindestgr" OE "\236e: %d Pixel|Kleinere Fl" AE "chen werden|"
+                "zusammengefasst (1 = aus).|Auch mit Tasten + und -][ - | + |Fertig]", min_px);
+            b = FormAlert(3, buf);
+            if (b == 1) set_min_px(-1);
+            else if (b == 2) set_min_px(+1);
+            else break;
+        }
     }
 }
 
@@ -1906,6 +1951,8 @@ static void __CDECL on_key(WINDOW *win, short buff[8])
     case 'C': toggle_colors(); break;
     case 'D': if (!scanning && root) show_scan_details(); break;
     case 'T': show_timing = !show_timing; t_draw_shown = t_draw; update_info(); break;
+    case '+': set_min_px(+1); break;
+    case '-': set_min_px(-1); break;
     case 'G': show_dirs = !show_dirs; relayout_redraw(); break;
     case '\r': case '\n': zoom_in(); break;
     case 0x08: zoom_out(); break;
