@@ -2,9 +2,9 @@
 
 ## 1. Vor einer Veröffentlichung
 
-- [ ] Lizenz: Das Repo ist öffentlich, hat aber keine Lizenzdatei. Rechtlich heißt das „alle Rechte vorbehalten“, niemand darf den Code verwenden. Dazu kommt: WinDom steht unter der LGPL und wird statisch gelinkt. Weil dein Quelltext offen ist, ist das unproblematisch, sollte aber im README stehen. GPL oder MIT wären naheliegende Lizenzen.
-- [ ] README: Das README aus der alten Unterhaltung ist nie ins Repo gekommen. Hinein gehören: Bauanleitung, Tastenkürzel, DXMAP.INF, unterstützte Systeme.
-- [ ] Fertige Programme: Die .prg sind per .gitignore ausgeschlossen. Zum Herunterladen eignet sich ein GitHub-Release mit den drei Programmen.
+- [x] Lizenz: Das Repo ist öffentlich, hat aber keine Lizenzdatei. Rechtlich heißt das „alle Rechte vorbehalten“, niemand darf den Code verwenden. Dazu kommt: WinDom steht unter der LGPL und wird statisch gelinkt. Weil dein Quelltext offen ist, ist das unproblematisch, sollte aber im README stehen. GPL oder MIT wären naheliegende Lizenzen.
+- [x] README: Das README aus der alten Unterhaltung ist nie ins Repo gekommen. Hinein gehören: Bauanleitung, Tastenkürzel, DXMAP.INF, unterstützte Systeme.
+- [x] Fertige Programme: Die .prg sind per .gitignore ausgeschlossen. Zum Herunterladen eignet sich ein GitHub-Release mit den drei Programmen.
 
 ## 2. Offene Tests
 
