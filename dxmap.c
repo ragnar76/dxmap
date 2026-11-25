@@ -915,6 +915,14 @@ static void __CDECL evnt_draw(WINDOW *win, short buff[8])
     t_draw += clock() - t0;
 }
 
+static void count_tree(const Node *n, u32 *f, u32 *d)
+{
+    const Node *c;
+    for (c = n->child; c; c = c->next)
+        if (c->isdir) { (*d)++; count_tree(c, f, d); }
+        else (*f)++;
+}
+
 static void update_title(void)
 {
     char path[PATHLEN], sz[40];
@@ -922,8 +930,12 @@ static void update_title(void)
         build_path(view_root, path, sizeof path);
         fmt_size(view_root->size, sz);
         if (scanning) snprintf(title, sizeof title, " %s: %s ", APPNAME, path);
-        else          snprintf(title, sizeof title, " %s: %s  (%s)%s ", APPNAME, path, sz,
-                               cells_full ? "  [Anzeige begrenzt]" : "");
+        else {
+            u32 f = 0, d = 0;                    /* counts of the current view (zoom!) */
+            count_tree(view_root, &f, &d);
+            snprintf(title, sizeof title, " %s: %s  (%s, %lu Dateien, %lu Ordner)%s ",
+                     APPNAME, path, sz, f, d, cells_full ? "  [Anzeige begrenzt]" : "");
+        }
     } else
         snprintf(title, sizeof title, " %s ", APPNAME);
     if (mainwin) WindSetStr(mainwin, WF_NAME, title);
@@ -1237,6 +1249,11 @@ static void __CDECL set_toggle(WINDOW *win, int index, int mode, void *data)
     *var = !*var;
     settree[cbox].ob_spec.index = CB_SPEC(*var);
     ObjcDraw(OC_FORM, win, cbox, 0);
+    {   /* WinDom returns TOUCHEXIT objects on the press; the main loop waits for "any
+         * button down", so the same click came in again and toggled straight back */
+        short d, mb;
+        do graf_mkstate(&d, &d, &mb, &d); while (mb);
+    }
 }
 
 static void __CDECL set_popup(WINDOW *win, int index, int mode, void *data)
@@ -1257,7 +1274,12 @@ static void __CDECL set_popup(WINDOW *win, int index, int mode, void *data)
         t_min = min_steps[r - 1];
         set_pop_txt(t_min);
     }
-    ObjcDraw(OC_FORM, win, index, 0);
+    {   /* the popup's background was not restored in monochrome (TOS 4.04), so redraw
+         * the whole settings window through the queue */
+        short wx, wy, ww, wh;
+        wind_get(win->handle, WF_CURRXYWH, &wx, &wy, &ww, &wh);
+        ApplWrite(_AESapid, WM_REDRAW, win->handle, wx, wy, ww, wh);
+    }
 }
 
 static void __CDECL set_button(WINDOW *win, int index, int mode, void *data)
@@ -1925,12 +1947,12 @@ static void obj(int i, int next, int head, int tail, int type, int flags,
 static void build_menu(int scrw)
 {
     static char t0[] = " " APPNAME " ", t1[] = " Datei ", t2[] = " Ansicht ";
-    static char i_info[]  = "  Info...  ";
-    static char i_open[]  = "  " OEC "ffnen...  ";
-    static char i_pref[]  = "  Einstellungen...  ";
-    static char i_quit[]  = "  Beenden  ";
-    static char i_color[] = "  Farbmodus  ";
-    static char i_upd[]   = "  Aktualisieren  ";
+    static char i_info[]  = "  Info...  ^I  ";
+    static char i_open[]  = "  " OEC "ffnen...         ^O  ";
+    static char i_pref[]  = "  Einstellungen...  ^E  ";
+    static char i_quit[]  = "  Beenden           ^Q  ";
+    static char i_color[] = "  Farbmodus      ^C  ";
+    static char i_upd[]   = "  Aktualisieren  ^R  ";
     static char sep1[40], sep2[40];
     int barh = ch + 3;
     int l0 = (int)strlen(t0), l1 = (int)strlen(t1), l2 = (int)strlen(t2);
@@ -1984,26 +2006,125 @@ static void menu_done(WINDOW *win, int ttl)
     ApplWrite(_AESapid, WM_REDRAW, win->handle, x, y, w, menutree[1].ob_height + 4);
 }
 
+/* ---------------------------------------------------------------------------------
+ * Text windows (Info, scan details): a WinDom form in its own window instead of a
+ * modal alert, so under MiNT/MagiC the rest of the system keeps running. Lines are
+ * G_STRINGs plus an OK button; OK or the closer close it, and the AES sends the
+ * redraw for what was under it. Opening it again just tops it (FormCreate finds the
+ * window by its tree) and refreshes the text.
+ * ------------------------------------------------------------------------------- */
+#define TW_MAXL  12
+typedef struct {
+    OBJECT  tree[TW_MAXL + 2];
+    char    line[TW_MAXL][64];
+    char    name[48];
+    WINDOW *win;
+} TextWin;
+static TextWin tw_info, tw_det;
+
+static void __CDECL tw_destroy(WINDOW *win, short buff[8])
+{
+    if (tw_info.win == win) tw_info.win = NULL;
+    if (tw_det.win  == win) tw_det.win  = NULL;
+}
+
+static void __CDECL tw_ok(WINDOW *win, int index, int mode, void *data)
+{
+    ObjcChange(OC_FORM, win, index, OS_NORMAL, FALSE);
+    ApplWrite(_AESapid, WM_DESTROY, win->handle, 0, 0, 0, 0);
+}
+
+static void text_window(TextWin *t, int n)
+{
+    OBJECT *o = t->tree;
+    int i, maxl = 20, bh = ch + 4, W, H, ok = n + 1;
+    short rx = o[0].ob_x, ry = o[0].ob_y;               /* keep the position if open */
+
+    for (i = 0; i < n; i++) if ((int)strlen(t->line[i]) > maxl) maxl = (int)strlen(t->line[i]);
+    W = (maxl + 4) * cw;
+    H = (n + 3) * ch + bh;
+    memset(o, 0, sizeof t->tree);
+    o[0].ob_next = -1; o[0].ob_head = 1; o[0].ob_tail = ok;
+    o[0].ob_type = G_BOX; o[0].ob_spec.index = 0x00001100L;
+    o[0].ob_x = t->win ? rx : 0; o[0].ob_y = t->win ? ry : 0;
+    o[0].ob_width = W; o[0].ob_height = H;
+    for (i = 0; i < n; i++) {
+        OBJECT *l = &o[i + 1];
+        l->ob_next = i + 2; l->ob_head = l->ob_tail = -1;
+        l->ob_type = G_STRING; l->ob_spec.free_string = t->line[i];
+        l->ob_x = 2 * cw; l->ob_y = (i + 1) * ch;
+        l->ob_width = (int)strlen(t->line[i]) * cw; l->ob_height = ch;
+    }
+    o[ok].ob_next = 0; o[ok].ob_head = o[ok].ob_tail = -1;
+    o[ok].ob_type = G_BUTTON; o[ok].ob_spec.free_string = "OK";
+    o[ok].ob_flags = OF_SELECTABLE | OF_EXIT | OF_DEFAULT | OF_LASTOB;
+    o[ok].ob_width = 10 * cw; o[ok].ob_height = bh;
+    o[ok].ob_x = (W - 10 * cw) / 2; o[ok].ob_y = (n + 2) * ch;
+
+    if (t->win) {                                        /* already open: top + refresh */
+        short x, y, w, h;
+        WindSet(t->win, WF_TOP, 0, 0, 0, 0);
+        wind_get(t->win->handle, WF_CURRXYWH, &x, &y, &w, &h);
+        ApplWrite(_AESapid, WM_REDRAW, t->win->handle, x, y, w, h);
+        return;
+    }
+    t->win = FormCreate(o, WAT_FORM, NULL, t->name, NULL, TRUE, FALSE);
+    if (!t->win) return;
+    EvntAdd(t->win, WM_DESTROY, tw_destroy, EV_TOP);
+    ObjcAttachFormFunc(t->win, ok, tw_ok, NULL);
+}
+
+static void show_info(void)
+{
+    static const char *txt[] = {
+        APPNAME " " APPVERSION " f" UE "r Atari",
+        "Treemap der Plattenbelegung",
+        "",
+        "\275 2026 Bernd Mueller",
+        "Freie Software unter der GNU GPL v3 oder",
+        "sp" AE "ter, ohne jede Gew" AE "hr.",
+        "",
+        "Klick: w" AE "hlen     Doppelklick/Return: Zoom",
+        "Backspace: heraus   Rechtsklick: Datei-Men" UE,
+        "+ / -: Mindestgr" OE "\236e   T: Messung   D: Details",
+        "Esc: Scan abbrechen   Strg+Q: Beenden"
+    };
+    int i, n = (int)(sizeof txt / sizeof txt[0]);
+    for (i = 0; i < n; i++) { strncpy(tw_info.line[i], txt[i], 63); tw_info.line[i][63] = 0; }
+    strcpy(tw_info.name, " " APPNAME ": Info ");
+    text_window(&tw_info, n);
+}
+
 static void show_scan_details(void)
 {
-    char b[400], a1[12], a2[12], a3[12], a4[12], a5[12];
+    char a1[12], a2[12], a3[12], a4[12], a5[12];
     const char *mode = !use_mint ? "Fsfirst" : use_dx ? "Dxreaddir" : "Dreaddir+Fxattr";
     clock_t rest = scan_ticks > t_step ? scan_ticks - t_step : 0;
+    char (*L)[64] = tw_det.line;
 
     fmt_ticks(scan_ticks, a1);
     fmt_ticks(rest, a5);
-    if (!probed) {
-        fmt_ticks(t_step, a2);
-        sprintf(b, "[1][Scan %s s, %s|Ordner lesen   %s s|GUI/Rest       %s s||"
-                   "Mehr: T vor dem Scan ein.][ OK ]", a1, mode, a2, a5);
-    } else {
+    sprintf(L[0], "Scan gesamt     %7s s", a1);
+    sprintf(L[1], "Lesemethode     %s", mode);
+    if (probed) {
         fmt_ticks(t_step > t_node ? t_step - t_node : 0, a2);
         fmt_ticks(t_node - t_hue, a3);
         fmt_ticks(t_hue, a4);
-        sprintf(b, "[1][Scan %s s, %s|OS lesen       %s s|Knoten/malloc  %s s|"
-                   "Endung/Farbe   %s s|GUI/Rest       %s s][ OK ]", a1, mode, a2, a3, a4, a5);
+        sprintf(L[2], "OS lesen        %7s s", a2);
+        sprintf(L[3], "Knoten/malloc   %7s s", a3);
+        sprintf(L[4], "Endung/Farbe    %7s s", a4);
+    } else {
+        fmt_ticks(t_step, a2);
+        sprintf(L[2], "Ordner lesen    %7s s", a2);
+        sprintf(L[3], "Knoten/malloc         -");
+        sprintf(L[4], "Endung/Farbe          -");
     }
-    FormAlert(1, b);
+    sprintf(L[5], "GUI/Rest        %7s s", a5);
+    sprintf(L[6], "Dateien/Ordner  %lu / %lu", n_files, n_dirs);
+    sprintf(L[7], "%s", probed ? "(gemessen mit T; die Messung kostet selbst Zeit)"
+                               : "Genauer: T vor dem Scan einschalten.");
+    strcpy(tw_det.name, " " APPNAME ": Scan-Details ");
+    text_window(&tw_det, 8);
 }
 
 /* WinDom's frm_menu draws the drop-down boxes straight onto the screen and puts the
@@ -2038,9 +2159,8 @@ static void __CDECL menu_unhilight(WINDOW *win, short msg[])
 
 static void __CDECL mi_info(WINDOW *win, int index, int ttl, void *data)
 {
-    FormAlert(1, "[1][" APPNAME " " APPVERSION " f" UE "r Atari|Treemap der Plattenbelegung||"
-                 "\275 2026 Bernd Mueller|GNU GPL v3, ohne Gew" AE "hr][ OK ]");
     menu_done(win, ttl);
+    show_info();
 }
 
 static void __CDECL mi_open(WINDOW *win, int index, int ttl, void *data)
@@ -2138,6 +2258,16 @@ static void __CDECL on_timer(WINDOW *win, short buff[8])
 static void __CDECL on_key(WINDOW *win, short buff[8])
 {
     int k = evnt.keybd & 0xFF;
+    if (evnt.mkstate & K_CTRL) {                 /* menu shortcuts, by scan code */
+        switch ((evnt.keybd >> 8) & 0xFF) {
+        case 0x17: show_info(); return;                                   /* ^I */
+        case 0x18: if (!scanning) choose_folder(); return;                /* ^O */
+        case 0x12: settings(); return;                                    /* ^E */
+        case 0x10: ApplWrite(_AESapid, WM_DESTROY, win->handle, 0, 0, 0, 0); return;  /* ^Q */
+        case 0x2E: toggle_colors(); return;                               /* ^C */
+        case 0x13: refresh(); return;                                     /* ^R */
+        }
+    }
     if (k >= 'a' && k <= 'z') k -= 32;
     switch (k) {
     case 'Q': case 0x11: ApplWrite(_AESapid, WM_DESTROY, win->handle, 0, 0, 0, 0); break;
@@ -2152,7 +2282,7 @@ static void __CDECL on_key(WINDOW *win, short buff[8])
     case '\r': case '\n': zoom_in(); break;
     case 0x08: zoom_out(); break;
     case 0x1B: if (scanning) { scan_aborted = 1; finish_scan(); } break;
-    case 'H': case '?': mi_info(win, 0, 0, NULL); break;
+    case 'H': case '?': show_info(); break;
     default: break;
     }
 }

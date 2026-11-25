@@ -87,24 +87,28 @@ wird danach ohne neuen Scan angepasst.
 
 | Taste | Wirkung |
 |---|---|
-| **O** | Ordner öffnen (neuer Scan) |
-| **R** | aktualisieren (denselben Ordner neu scannen) |
+| **Strg+O** / **O** | Ordner öffnen (neuer Scan) |
+| **Strg+R** / **R** | aktualisieren (denselben Ordner neu scannen) |
+| **Strg+E** | Einstellungen |
 | **Esc** | laufenden Scan abbrechen (Ergebnis wird als unvollständig markiert) |
 | **Return** | eine Ebene tiefer zoomen (wie Doppelklick) |
 | **Backspace** | eine Ebene heraus |
-| **C** | Kissen-Schattierung ein/aus |
+| **Strg+C** / **C** | Kissen-Schattierung ein/aus |
 | **G** | Ordnerränder ein/aus |
 | **+** / **−** | Mindestgröße der Kacheln erhöhen/verringern |
 | **T** | Zeitmessung in der Statusleiste ein/aus |
-| **D** | Aufschlüsselung der Scan-Zeit (genauer, wenn **T** vor dem Scan an war) |
-| **H** / **?** | Info |
-| **Q** / **Ctrl+Q** | beenden |
+| **D** | Fenster mit der Aufschlüsselung der Scan-Zeit (genauer, wenn **T** vor dem Scan an war) |
+| **Strg+I** / **H** / **?** | Info-Fenster (Version, Copyright, Kurzhilfe) |
+| **Strg+Q** / **Q** | beenden |
 
 ### Menü
 
-- **DxMap → Info**
-- **Datei → Öffnen…, Einstellungen…, Beenden**
-- **Ansicht → Farbmodus** (Kissen-Schattierung, Häkchen) und **Aktualisieren**
+- **DxMap → Info…** (^I)
+- **Datei → Öffnen…** (^O), **Einstellungen…** (^E), **Beenden** (^Q)
+- **Ansicht → Farbmodus** (^C, Kissen-Schattierung mit Häkchen) und **Aktualisieren** (^R)
+
+Info, Einstellungen und Scan-Details öffnen sich in eigenen Fenstern statt in
+Alert-Boxen. Unter MiNT und MagiC laufen andere Programme dabei weiter.
 
 ### Einstellungen
 
@@ -127,7 +131,12 @@ hidden=1
 minpx=2
 ```
 
-### Statusleiste
+### Titel- und Statusleiste
+
+Der Fenstertitel zeigt den angezeigten Ordner mit Gesamtgröße sowie die Zahl der
+Dateien und Ordner darin, z. B. `DxMap: C:\GAMES  (12.3 MB, 8459 Dateien, 1009 Ordner)`.
+Nach dem Hineinzoomen gelten die Angaben für den gezoomten Ordner.
+
 
 Unten im Fenster stehen während des Scans die Zahl der Dateien und Ordner, danach
 Pfad und Größe der gewählten Datei, das Ergebnis der letzten Dateioperation oder die
