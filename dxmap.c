@@ -18,7 +18,7 @@ long _stksize = 32768L;
 #define UE  "\201"
 #define OEC "\231"
 
-#define APPNAME     "X-Map"
+#define APPNAME     "DxMap"
 
 typedef unsigned long long u64;
 typedef unsigned long      u32;
@@ -1087,7 +1087,7 @@ static void set_min_px(int step)               /* step -1 / +1 through min_steps
  * Checkboxes are a G_BOXCHAR square ('X' or blank) plus a clickable label, both
  * TOUCHEXIT. WinDom's own 3D checkbox type (DCRBUTTON) is drawn by xobjc.ldg and would
  * fall back to nothing if that LDG is missing, so plain AES objects are used.
- * Changes go to the t_* copies; OK applies them, Sichern applies and writes X-MAP.INF,
+ * Changes go to the t_* copies; OK applies them, Sichern applies and writes DXMAP.INF,
  * Abbruch (or the closer) throws them away.
  * ------------------------------------------------------------------------------- */
 enum { S_ROOT, S_T1, S_CB_DIRS, S_L_DIRS, S_CB_CUSH, S_L_CUSH, S_L_MIN, S_POP_MIN,
@@ -1175,7 +1175,7 @@ static void apply_settings(void)
     else if (recolor) redraw_all();
 }
 
-/* X-MAP.INF: plain "key=value" lines, next to the program (start directory) */
+/* DXMAP.INF: plain "key=value" lines, next to the program (start directory) */
 static void load_settings(void)
 {
     char line[80], key[24];
@@ -2182,11 +2182,11 @@ int main(int argc, char **argv)
     mainwin->h_min = 120;
     vh = mainwin->graf->handle;
     setup_colors();
-    {                                               /* X-MAP.INF in the start directory */
+    {                                               /* DXMAP.INF in the start directory */
         char d[PATHLEN];
         d[0] = 0;
         Dgetpath(d, 0);
-        snprintf(inf_path, sizeof inf_path, "%c:%s\\X-MAP.INF", 'A' + (int)Dgetdrv(), d);
+        snprintf(inf_path, sizeof inf_path, "%c:%s\\DXMAP.INF", 'A' + (int)Dgetdrv(), d);
         load_settings();
     }
     build_menu(app.w);
