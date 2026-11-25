@@ -1,3 +1,20 @@
+/*
+ * DxMap - treemap of disk usage for Atari TOS / MiNT / MagiC (GEM, WinDom)
+ * Copyright (C) 2026 Bernd Mueller
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +36,7 @@ long _stksize = 32768L;
 #define OEC "\231"
 
 #define APPNAME     "DxMap"
+#define APPVERSION  "0.1.0"
 
 typedef unsigned long long u64;
 typedef unsigned long      u32;
@@ -2020,8 +2038,8 @@ static void __CDECL menu_unhilight(WINDOW *win, short msg[])
 
 static void __CDECL mi_info(WINDOW *win, int index, int ttl, void *data)
 {
-    FormAlert(1, "[1][" APPNAME " f" UE "r Atari|Treemap der Plattenbelegung|"
-                 "Rechtsklick auf Datei:|Kopieren, Verschieben, L" OE "schen][ OK ]");
+    FormAlert(1, "[1][" APPNAME " " APPVERSION " f" UE "r Atari|Treemap der Plattenbelegung||"
+                 "\275 2026 Bernd Mueller|GNU GPL v3, ohne Gew" AE "hr][ OK ]");
     menu_done(win, ttl);
 }
 
