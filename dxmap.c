@@ -1139,7 +1139,10 @@ static void sobj(int i, int next, int head, int tail, int type, int flags, int s
     o->ob_x = x; o->ob_y = y; o->ob_width = w; o->ob_height = h;
 }
 
-#define CB_SPEC(on)  ((((long)((on) ? 'X' : ' ')) << 24) | 0x00011100L)
+/* G_BOXCHAR: char, 1 pixel frame, colour word 0x1170 = frame 1, text 1, fill pattern 7
+ * (solid) in colour 0 (white). Must be opaque: the box alone is redrawn when toggled,
+ * and with a hollow fill a ' ' drawn over an 'X' left the X standing. */
+#define CB_SPEC(on)  ((((long)((on) ? 'X' : ' ')) << 24) | 0x00011170L)
 
 static void set_pop_txt(int px)
 {
@@ -1248,7 +1251,7 @@ static void __CDECL set_toggle(WINDOW *win, int index, int mode, void *data)
     if (settree[cbox].ob_state & OS_DISABLED) return;
     *var = !*var;
     settree[cbox].ob_spec.index = CB_SPEC(*var);
-    ObjcDraw(OC_FORM, win, cbox, 0);
+    ObjcDrawParent(OC_FORM, win, cbox, 1, MAX_DEPTH);     /* root (white) + box, clipped */
     {   /* WinDom returns TOUCHEXIT objects on the press; the main loop waits for "any
          * button down", so the same click came in again and toggled straight back */
         short d, mb;
